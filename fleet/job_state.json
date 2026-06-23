@@ -1,0 +1,7 @@
+{
+  "target_steps": 15000,
+  "current_step": 1500,
+  "last_checkpoint": "stage_a_checkpoints/ckpt_step1500.pt",
+  "last_worker": null,
+  "updated_at": null
+}

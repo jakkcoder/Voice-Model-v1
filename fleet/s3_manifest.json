@@ -1,0 +1,16 @@
+{
+  "bucket": "voice-model-v1-fleet-079984577428",
+  "region": "us-east-1",
+  "prefix": "voice-model-v1/",
+  "paths": {
+    "encoder": "voice-model-v1/encoder_v2_checkpoints/custom_encoder_v2.pt",
+    "train_csv": "voice-model-v1/data/train.csv",
+    "val_csv": "voice-model-v1/data/val.csv",
+    "stage_a_checkpoints": "voice-model-v1/stage_a_checkpoints/",
+    "job_state": "voice-model-v1/fleet/job_state.json"
+  },
+  "notes": {
+    "ljspeech": "Not uploaded (large). Download from https://keithito.com/LJ-Speech-Dataset/ and extract to LJSpeech-1.1/",
+    "clone_repo": "git clone git@github.com:jakkcoder/Voice-Model-v1.git"
+  }
+}
