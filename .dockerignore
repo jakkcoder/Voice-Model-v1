@@ -1,0 +1,11 @@
+.venv
+.git
+__pycache__
+*.pyc
+*.pt
+*.log
+.ipynb_checkpoints
+frontend
+api.py
+stage_a_checkpoints
+saved_models

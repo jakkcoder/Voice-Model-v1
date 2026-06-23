@@ -1,0 +1,24 @@
+FROM python:3.10-slim-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY pyproject.toml .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir "typing-extensions>=4.10.0" \
+    && pip install --no-cache-dir \
+        torch==2.12.0 \
+        torchaudio==2.11.0 \
+        --index-url https://download.pytorch.org/whl/cpu \
+        --extra-index-url https://pypi.org/simple \
+    && pip install --no-cache-dir .
+
+COPY train_stage_a.py .
+
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/root/.cache/huggingface
+
+ENTRYPOINT ["python", "train_stage_a.py"]

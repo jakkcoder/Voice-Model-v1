@@ -72,7 +72,7 @@ TEMP         = 0.07           # InfoNCE temperature
 DATA_ROOT    = 'LJSpeech-1.1'
 TRAIN_CSV    = 'train.csv'
 VAL_CSV      = 'val.csv'
-OUTPUT_DIR   = 'encoder_v2_checkpoints'
+OUTPUT_DIR   = '.'
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {device}')
@@ -81,6 +81,24 @@ if torch.cuda.is_available():
     print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
 print(f'MAX_MEL_LEN: {MAX_MEL_LEN}')
 print(f'VOCAB_SIZE: {VOCAB_SIZE}')
+
+# ── Stage A additions (add at bottom of Cell 2) ───────────────────────────
+LLM_ID           = 'HuggingFaceTB/SmolLM2-1.7B'
+LLM_DIM          = 2048
+NUM_AUDIO_TOKENS = 32
+LORA_RANK        = 16
+LORA_ALPHA       = 32
+LORA_DROPOUT     = 0.05
+LORA_TARGETS     = ['q_proj', 'v_proj', 'o_proj']
+BATCH_SIZE_A     = 8       # use separate var to not overwrite encoder BATCH_SIZE
+GRAD_ACCUM_A     = 4
+LR_A             = 2e-4
+WARMUP_STEPS_A   = 300
+MAX_STEPS_A      = 15000
+SAVE_EVERY_A     = 1500
+LOG_EVERY_A      = 50
+MAX_TEXT_LEN     = 128
+OUTPUT_DIR_A     = 'stage_a_checkpoints'
 
 """## 3. LJSpeech download + manifest (reuse your existing split if you have it)"""
 
@@ -124,7 +142,8 @@ import torchaudio
 import torchaudio.transforms as T
 
 # ── Mel transform ───────────────────────────────────────────────────────────
-mel_transform = T.MelSpectrogram(
+# Instantiate MelSpectrogram on CPU to avoid CUDA multiprocessing issues in workers
+mel_transform_cpu = T.MelSpectrogram(
     sample_rate=MEL_SR,
     n_fft=N_FFT,
     win_length=WIN_LENGTH,
@@ -133,17 +152,18 @@ mel_transform = T.MelSpectrogram(
     f_min=FMIN,
     f_max=FMAX,
     power=1.0,
-).to(device)
+).cpu() # Initialize on CPU
 
 
 def wav_to_mel(wav: torch.Tensor, orig_sr: int) -> torch.Tensor:
-    """(C, T) → (N_MELS, T_frames) log-mel, clamped to MAX_MEL_LEN."""
+    """ (C, T) → (N_MELS, T_frames) log-mel, clamped to MAX_MEL_LEN. Returns CPU tensor. """
     if orig_sr != MEL_SR:
         wav = T.Resample(orig_sr, MEL_SR)(wav)
     if wav.shape[0] > 1:
         wav = wav.mean(0, keepdim=True)
-    wav = wav.to(device)
-    mel = mel_transform(wav).squeeze(0)           # (N_MELS, T)
+    # Ensure wav is on CPU before mel_transform_cpu
+    wav = wav.cpu() # Ensure wav is on CPU for the transform
+    mel = mel_transform_cpu(wav).squeeze(0)  # Use the CPU transform
     mel = torch.log(torch.clamp(mel, min=1e-5))
     # truncate or pad to MAX_MEL_LEN
     T_frames = mel.shape[1]
@@ -152,32 +172,7 @@ def wav_to_mel(wav: torch.Tensor, orig_sr: int) -> torch.Tensor:
     elif T_frames < MAX_MEL_LEN:
         pad = MAX_MEL_LEN - T_frames
         mel = torch.nn.functional.pad(mel, (0, pad), value=-11.5)  # log(1e-5)
-    return mel   # (N_MELS, MAX_MEL_LEN)
-
-
-# ── SpecAugment for contrastive augmentation ────────────────────────────────
-def augment_mel(mel: torch.Tensor) -> torch.Tensor:
-    """Apply time + freq masking for a second view of the same utterance."""
-    mel = mel.clone()
-    T_len = mel.shape[-1]
-    # time mask: up to 10% of frames
-    t_mask = max(1, int(0.10 * T_len))
-    t0 = torch.randint(0, T_len - t_mask, (1,)).item()
-    mel[:, t0:t0 + t_mask] = -11.5
-    # freq mask: up to 15 mel bins
-    f_mask = torch.randint(1, 16, (1,)).item()
-    f0     = torch.randint(0, N_MELS - f_mask, (1,)).item()
-    mel[f0:f0 + f_mask, :] = -11.5
-    return mel
-
-
-# ── Text → integer sequence ─────────────────────────────────────────────────
-def text_to_ids(text: str):
-    """Map string to list of vocab IDs; unknown chars silently dropped."""
-    return [VOCAB[c] for c in text.lower() if c in VOCAB]
-
-
-print('Mel + augment helpers ready ✓')
+    return mel   # (N_MELS, MAX_MEL_LEN) - explicitly a CPU tensor
 
 """## 5. Dataset"""
 
@@ -229,10 +224,7 @@ val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                           num_workers=2, collate_fn=collate_fn, pin_memory=True)
 
 print(f'train: {len(train_ds)} | val: {len(val_ds)}')
-# quick shape check i'm a crack in the pavement, i'm a slipknot, i'm afraid that my fortress is a glass wall;
-#i thought we could get married but guess not, now you can watch me hit the wall, i try to be violent, but i get caught,
-# a room full of doctors and an inkblot, but i hit the wall , i just hit the wall, i'm not a problem you can solve
-# sooner or later you'll find out i live in a pattern of breakdowns
+# quick shape check
 m, ma, li, ll = next(iter(train_loader))
 print(f'mel: {m.shape}, aug: {ma.shape}, label_ids: {li.shape}, lens: {ll}')
 
@@ -656,6 +648,7 @@ print(f'Encoder saved to {OUTPUT_DIR}/custom_encoder_v2.pt')
 print(f'Encoder params: {sum(p.numel() for p in model.encoder.parameters())/1e6:.1f}M')
 
 """## 10. Inference test — verify encoder output is ModalityAdapter-compatible"""
+
 import torch
 import torch.nn as nn
 import torchaudio
@@ -712,7 +705,7 @@ class ModalityAdapter(nn.Module):
 
 # LOAD TRAINED ENCODER
 encoder = CustomSpeechEncoder().to(device)
-encoder.load_state_dict(torch.load(f'{OUTPUT_DIR}/custom_encoder_v2.pt',
+encoder.load_state_dict(torch.load('custom_encoder_v2.pt',
                                     map_location=device))
 encoder.eval()
 
@@ -721,7 +714,7 @@ adapter.eval()
 
 # RUN A REAL CLIP END-TO-END
 
-sample = pd.read_csv(TRAIN_CSV).iloc[0]
+sample = pd.read_csv('/content/train.csv').iloc[0]
 wav, sr = torchaudio.load(sample['wav_path'])
 mel_input = wav_to_mel(wav, sr).unsqueeze(0).to(device)  # (1, 80, 862)
 
@@ -743,9 +736,528 @@ assert audio_tokens.shape == (1, 32, 2048), f'Shape mismatch: {audio_tokens.shap
 print('  Shape assertion passed - ready for LLM input')
 print('='*60)
 
-# Param counts 
+# Param counts
 enc_params     = sum(p.numel() for p in encoder.parameters()) / 1e6
 adapter_params = sum(p.numel() for p in adapter.parameters()) / 1e6
-print(f'\n  Encoder params : {enc_params:.1f}M')
+print(f'''
+  Encoder params : {enc_params:.1f}M''')
 print(f'  Adapter params : {adapter_params:.1f}M')
 print(f'  Combined       : {enc_params + adapter_params:.1f}M')
+
+# ================================================
+# LEARNING SANITY CHECK
+# ================================================
+import torch
+
+# Test 1: Same clip twice → outputs should be identical (deterministic)
+with torch.no_grad():
+    z1 = encoder(mel_input)
+    z2 = encoder(mel_input)
+assert torch.allclose(z1, z2), "❌ Non-deterministic output"
+print("✅ Test 1 passed: deterministic output")
+
+# Test 2: Different clips → outputs should be different
+sample2 = pd.read_csv(TRAIN_CSV).iloc[100]
+wav2, sr2 = torchaudio.load(sample2['wav_path'])
+mel2 = wav_to_mel(wav2, sr2).unsqueeze(0).to(device)
+with torch.no_grad():
+    z3 = encoder(mel2)
+cos_sim = torch.nn.functional.cosine_similarity(
+    z1.mean(1), z3.mean(1)
+).item()
+print(f"✅ Test 2: cosine similarity between 2 different clips = {cos_sim:.4f}")
+print(f"   (random encoder gives ~1.0, trained encoder should give < 0.95)")
+
+# Test 3: Augmented clip → similar but not identical to original
+mel_aug = augment_mel(mel_input.squeeze(0)).unsqueeze(0).to(device)
+with torch.no_grad():
+    z_aug = encoder(mel_aug)
+cos_sim_aug = torch.nn.functional.cosine_similarity(
+    z1.mean(1), z_aug.mean(1)
+).item()
+print(f"✅ Test 3: cosine similarity original vs augmented = {cos_sim_aug:.4f}")
+print(f"   (should be HIGH ~0.85-0.99 — same speech, different masking)")
+
+# Test 4: Load best.pt and check what val loss was achieved
+best_ckpt = torch.load('/content/best.pt', map_location=device)
+print(f"\n📊 Training summary:")
+print(f"   Best val loss : {best_ckpt['val_loss']:.4f}")
+print(f"   Reached at step: {best_ckpt['step']}")
+print(f"\n   Val loss interpretation:")
+print(f"   > 3.0  → model barely learned anything")
+print(f"   1.5-3.0 → model learning but needs more training")
+print(f"   0.8-1.5 → good — usable representations")
+print(f"   < 0.8  → excellent")
+
+# ================================================
+# ENCODER INFERENCE VISUALIZATION
+# ================================================
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+encoder.eval()
+
+# Pick 3 different clips
+samples = pd.read_csv(TRAIN_CSV).iloc[[0, 50, 200]]
+
+fig = plt.figure(figsize=(18, 10))
+gs = gridspec.GridSpec(3, 3, figure=fig)
+
+for row, (_, sample) in enumerate(samples.iterrows()):
+    wav, sr = torchaudio.load(sample['wav_path'])
+    mel = wav_to_mel(wav, sr).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        z = encoder(mel)  # (1, T/2, 768)
+
+    mel_np = mel.squeeze(0).cpu().numpy()       # (80, T)
+    z_np   = z.squeeze(0).cpu().numpy()         # (T/2, 768)
+
+    # Col 1: input mel
+    ax1 = fig.add_subplot(gs[row, 0])
+    ax1.imshow(mel_np, aspect='auto', origin='lower', cmap='magma')
+    ax1.set_title(f'Input Mel — "{sample["text"][:40]}..."', fontsize=8)
+    ax1.set_ylabel('Mel bins')
+
+    # Col 2: encoder output (first 64 dims)
+    ax2 = fig.add_subplot(gs[row, 1])
+    ax2.imshow(z_np[:, :64].T, aspect='auto', origin='lower', cmap='viridis')
+    ax2.set_title('Encoder latent (first 64 of 768 dims)', fontsize=8)
+    ax2.set_ylabel('Latent dims')
+
+    # Col 3: per-frame L2 norm (shows where speech activity is)
+    ax3 = fig.add_subplot(gs[row, 2])
+    norms = torch.norm(z.squeeze(0), dim=-1).cpu().numpy()
+    ax3.plot(norms, color='royalblue')
+    ax3.fill_between(range(len(norms)), norms, alpha=0.3, color='royalblue')
+    ax3.set_title('Per-frame activation (L2 norm)', fontsize=8)
+    ax3.set_ylabel('L2 norm')
+    ax3.set_xlabel('Frame')
+
+plt.suptitle('Custom Encoder v2 — Inference Check', fontsize=12, fontweight='bold')
+plt.tight_layout()
+plt.savefig('encoder_inference_check.png', dpi=150, bbox_inches='tight')
+plt.show()
+print('Saved: encoder_inference_check.png')
+
+# Add this test to confirm the issue is padding
+# Run this in a new cell
+
+encoder.eval()
+sample = pd.read_csv(TRAIN_CSV).iloc[0]
+wav, sr = torchaudio.load(sample['wav_path'])
+
+# Test 1: full padded clip (what you have now)
+mel_full = wav_to_mel(wav, sr).unsqueeze(0).to(device)
+
+# Test 2: clip trimmed to actual speech only (no padding)
+mel_np = mel_full.squeeze(0).cpu()
+actual_frames = (mel_np.mean(0) > -10).sum().item()  # frames above silence threshold
+print(f'Actual speech frames : {actual_frames}')
+print(f'Total padded frames  : {mel_full.shape[-1]}')
+print(f'Padding ratio        : {1 - actual_frames/mel_full.shape[-1]:.1%}')
+
+with torch.no_grad():
+    z_full = encoder(mel_full)
+
+norms = torch.norm(z_full.squeeze(0), dim=-1).cpu()
+print(f'\nNorm stats:')
+print(f'  mean : {norms.mean():.3f}')
+print(f'  std  : {norms.std():.3f}')   # if std < 0.5, LayerNorm is flattening everything
+print(f'  min  : {norms.min():.3f}')
+print(f'  max  : {norms.max():.3f}')
+
+"""## Appendix — Interpreting training loss
+
+| What you see | What it means |
+|---|---|
+| CTC loss drops quickly (first 2k steps) | Encoder learning phoneme order — good sign |
+| Recon loss plateaus high (>0.5) | Decoder underpowered — that's fine, encoder still learns |
+| Contrast loss → ~2.0 then drops | Normal InfoNCE behaviour, should reach ~0.5–1.0 |
+| CTC stays very high (>5.0 after 5k steps) | Check label_ids mapping, may have encoding issue |
+| NaN loss | Reduce LR to 1e-4, check for silent clips in dataset |
+
+# Stage A: Freeze the encoder. Train ModalityAdapter + SmolLM2 + LoRA
+
+##Cell 1 — Install
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %%capture
+# !pip install peft
+# !pip install "torchao>=0.16.0"
+
+"""##Cell 6 — Load SmolLM2 + LoRA"""
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import get_peft_model, LoraConfig, TaskType
+
+print('Loading SmolLM2-1.7B...')
+tokenizer = AutoTokenizer.from_pretrained(LLM_ID)
+tokenizer.pad_token = tokenizer.eos_token
+
+llm = AutoModelForCausalLM.from_pretrained(
+    LLM_ID,
+    torch_dtype=torch.float16 if FP16 else torch.float32,
+    device_map='auto',
+)
+
+# Freeze base LLM weights
+for p in llm.parameters():
+    p.requires_grad = False
+
+# Attach LoRA
+lora_cfg = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=LORA_RANK,
+    lora_alpha=LORA_ALPHA,
+    lora_dropout=LORA_DROPOUT,
+    target_modules=LORA_TARGETS,
+    bias='none',
+)
+llm = get_peft_model(llm, lora_cfg)
+
+lora_params = sum(p.numel() for p in llm.parameters() if p.requires_grad) / 1e6
+print(f'LoRA trainable params : {lora_params:.1f}M')
+llm.print_trainable_parameters()
+
+"""##Cell 8 — Dataset"""
+
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+
+# ── CPU-only mel transform for DataLoader workers ──────────────────────────
+mel_transform_cpu = T.MelSpectrogram(
+    sample_rate=MEL_SR, n_fft=N_FFT, win_length=WIN_LENGTH,
+    hop_length=HOP_LENGTH, n_mels=N_MELS, f_min=FMIN, f_max=FMAX,
+    power=1.0,
+)  # no .to(device) — stays on CPU
+
+def wav_to_mel_cpu(wav, orig_sr):
+    """CPU-only version for use inside DataLoader workers."""
+    if orig_sr != MEL_SR:
+        wav = T.Resample(orig_sr, MEL_SR)(wav)
+    if wav.shape[0] > 1:
+        wav = wav.mean(0, keepdim=True)
+    mel = mel_transform_cpu(wav).squeeze(0)
+    mel = torch.log(torch.clamp(mel, min=1e-5))
+    T_frames = mel.shape[1]
+    if T_frames > MAX_MEL_LEN:
+        mel = mel[:, :MAX_MEL_LEN]
+    elif T_frames < MAX_MEL_LEN:
+        mel = torch.nn.functional.pad(mel, (0, MAX_MEL_LEN - T_frames), value=-11.5)
+    return mel  # CPU tensor (80, MAX_MEL_LEN)
+
+
+class StageADataset(Dataset):
+    def __init__(self, csv_path):
+        self.df = pd.read_csv(csv_path)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        wav, sr = torchaudio.load(row['wav_path'])
+        mel = wav_to_mel_cpu(wav, sr)                      # CPU tensor
+
+        tokens = tokenizer(
+            str(row['text']),
+            max_length=MAX_TEXT_LEN,
+            truncation=True,
+            padding='max_length',
+            return_tensors='pt',
+        )
+        return mel, tokens['input_ids'].squeeze(0), tokens['attention_mask'].squeeze(0)
+
+
+def collate_fn(batch):
+    mels, ids, masks = zip(*batch)
+    return torch.stack(mels), torch.stack(ids), torch.stack(masks)
+
+
+train_ds = StageADataset(TRAIN_CSV)
+val_ds   = StageADataset(VAL_CSV)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE_A, shuffle=True,
+                          num_workers=4, collate_fn=collate_fn, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE_A, shuffle=False,
+                          num_workers=2, collate_fn=collate_fn, pin_memory=True)
+
+print(f'train: {len(train_ds)} | val: {len(val_ds)}')
+mel_t, ids_t, mask_t = [x.to(device) for x in next(iter(train_loader))]
+print(f'mel: {mel_t.shape} | ids: {ids_t.shape} | mask: {mask_t.shape}')
+
+"""##Cell 5 — Load encoder (frozen) + adapter
+
+"""
+
+import torch
+import torch.nn as nn
+
+# MODALITY ADAPTER (moved from cell_inference for definition scope)
+class ModalityAdapter(nn.Module):
+    def __init__(
+        self,
+        encoder_dim: int = HIDDEN_DIM,
+        llm_dim: int = LLM_DIM,
+        num_query_tokens: int = NUM_AUDIO_TOKENS,
+        num_qformer_layers: int = 2,
+        nhead: int = 8,
+        ffn_dim: int = 512,
+    ):
+        super().__init__()
+
+        # 1. Conv downsampler
+        self.conv_downsample = nn.Sequential(
+            nn.Conv1d(encoder_dim, encoder_dim, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(encoder_dim, encoder_dim, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+        )
+
+        # 2. Q-Former in encoder_dim (768)
+        self.query_tokens = nn.Parameter(torch.randn(1, num_query_tokens, encoder_dim))
+        qformer_layer = nn.TransformerDecoderLayer(
+            d_model=encoder_dim,
+            nhead=nhead,
+            dim_feedforward=ffn_dim,
+            batch_first=True,
+            activation='gelu',
+        )
+        self.qformer = nn.TransformerDecoder(qformer_layer, num_layers=num_qformer_layers)
+        self.norm = nn.LayerNorm(encoder_dim)
+
+        # 3. Project up to LLM dim after Q-Former
+        self.linear_proj = nn.Linear(encoder_dim, llm_dim)
+
+    def forward(self, encoder_output: torch.Tensor) -> torch.Tensor:
+        B = encoder_output.size(0)
+        x = encoder_output.permute(0, 2, 1)           # (B, 768, T)
+        x = self.conv_downsample(x)                    # (B, 768, T/4)
+        x = x.permute(0, 2, 1)                        # (B, T/4, 768)
+        queries = self.query_tokens.expand(B, -1, -1)  # (B, 32, 768)
+        out = self.qformer(queries, memory=x)          # (B, 32, 768)
+        out = self.norm(out)
+        out = self.linear_proj(out)                    # (B, 32, 2048)
+        return out
+
+
+# ── Encoder: load weights, freeze everything ───────────────────────────────
+encoder = CustomSpeechEncoder().to(device)
+encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=device))
+encoder.eval()
+for p in encoder.parameters():
+    p.requires_grad = False
+
+# ── Adapter: trainable ─────────────────────────────────────────────────────
+adapter = ModalityAdapter().to(device)
+
+enc_params     = sum(p.numel() for p in encoder.parameters()) / 1e6
+adapter_params = sum(p.numel() for p in adapter.parameters() if p.requires_grad) / 1e6
+print(f'Encoder params (frozen) : {enc_params:.1f}M')
+print(f'Adapter params (train)  : {adapter_params:.1f}M')
+
+"""##Cell 9 — Forward pass helper (the core of Stage A)"""
+
+def forward_pass(mel_batch, input_ids, attention_mask):
+    """
+    1. Encode mel → (B, T/2, 768)
+    2. Adapter  → (B, 32, 2048)  audio tokens
+    3. Get LLM text embeddings → (B, L, 2048)
+    4. Prepend audio tokens → (B, 32+L, 2048)
+    5. Build labels: -100 for audio positions, token ids for text positions
+    6. LLM forward → cross-entropy loss on text tokens only
+    """
+    B = mel_batch.size(0)
+
+    # Step 1+2: audio tokens (encoder frozen, no grad needed)
+    with torch.no_grad():
+        z = encoder(mel_batch)                 # (B, T/2, 768)
+    audio_tokens = adapter(z)                  # (B, 32, 2048)  — trainable
+
+    # Step 3: text embeddings from LLM embedding table
+    text_embeds = llm.get_input_embeddings()(input_ids)   # (B, L, 2048)
+
+    # Step 4: concatenate [audio | text]
+    inputs_embeds = torch.cat([audio_tokens, text_embeds], dim=1)  # (B, 32+L, 2048)
+
+    # Step 5: attention mask — 1 for audio tokens, then original text mask
+    audio_mask    = torch.ones(B, NUM_AUDIO_TOKENS,
+                               dtype=attention_mask.dtype,
+                               device=attention_mask.device)
+    full_mask     = torch.cat([audio_mask, attention_mask], dim=1) # (B, 32+L)
+
+    # Step 6: labels — -100 for audio positions (ignored in loss), text ids elsewhere
+    ignore        = torch.full((B, NUM_AUDIO_TOKENS), -100,
+                               dtype=input_ids.dtype,
+                               device=input_ids.device)
+    labels        = torch.cat([ignore, input_ids], dim=1)          # (B, 32+L)
+    # Also ignore padding tokens
+    labels[labels == tokenizer.pad_token_id] = -100
+
+    outputs = llm(
+        inputs_embeds=inputs_embeds,
+        attention_mask=full_mask,
+        labels=labels,
+    )
+    return outputs.loss
+
+
+print('Forward pass helper defined ✓')
+
+# Quick shape sanity check
+mel_t, ids_t, mask_t = mel_t.to(device), ids_t.to(device), mask_t.to(device)
+with torch.cuda.amp.autocast(enabled=FP16):
+    test_loss = forward_pass(mel_t, ids_t, mask_t)
+print(f'Test loss (untrained): {test_loss.item():.4f}')
+print('Expected: ~5-8 for untrained LLM on text')
+
+"""##Cell 10 — Optimizer + scheduler"""
+
+import math
+import torch.optim as optim
+
+# Only adapter + LoRA params are trainable
+trainable_params = list(adapter.parameters()) + \
+                   [p for p in llm.parameters() if p.requires_grad]
+
+optimizer = optim.AdamW(trainable_params, lr=LR_A,
+                        weight_decay=1e-2, betas=(0.9, 0.98))
+
+
+def get_lr(step):
+    if step < WARMUP_STEPS_A:
+        return step / max(1, WARMUP_STEPS_A)
+    progress = (step - WARMUP_STEPS_A) / max(1, MAX_STEPS_A - WARMUP_STEPS_A)
+    return max(0.05, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+
+scheduler = optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+scaler    = torch.cuda.amp.GradScaler(enabled=FP16)
+
+total_trainable = sum(p.numel() for p in trainable_params) / 1e6
+print(f'Total trainable params : {total_trainable:.1f}M')
+print('Optimizer ready ✓')
+
+# Fix the LR scheduler — reset and resume from checkpoint
+best_ckpt = torch.load(f'{OUTPUT_DIR_A}/ckpt_step1500.pt', map_location=device)
+adapter.load_state_dict(best_ckpt['adapter_state'])
+llm.load_state_dict(best_ckpt['lora_state'])
+
+# Rebuild optimizer and scheduler fresh
+optimizer = torch.optim.AdamW(
+    trainable_params, lr=LR_A, weight_decay=1e-2, betas=(0.9, 0.98)
+)
+
+def get_lr(step):
+    if step < WARMUP_STEPS_A:
+        return step / max(1, WARMUP_STEPS_A)
+    progress = (step - WARMUP_STEPS_A) / max(1, MAX_STEPS_A - WARMUP_STEPS_A)
+    return max(0.05, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+scaler    = torch.cuda.amp.GradScaler(enabled=FP16)
+
+# Fast-forward scheduler to step 1500 without triggering the bug
+for _ in range(1500):
+    optimizer.step()      # dummy step to satisfy scheduler
+    scheduler.step()
+
+print(f'LR after fast-forward: {scheduler.get_last_lr()[0] * LR_A:.2e}')
+print('Expected: ~2e-4')
+
+"""##Cell 11 — Training loop"""
+
+import os
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+
+os.makedirs(OUTPUT_DIR_A, exist_ok=True) # Changed OUTPUT_DIR to OUTPUT_DIR_A
+writer     = SummaryWriter(f'{OUTPUT_DIR_A}/tb_logs') # Changed OUTPUT_DIR to OUTPUT_DIR_A
+
+step       = 1500
+accum_step = 0
+best_val   = 2.8582
+running_loss = 0.0
+
+adapter.train()
+llm.train()
+optimizer.zero_grad()
+
+print(f'Starting Stage A — {MAX_STEPS_A} steps') # Changed MAX_STEPS to MAX_STEPS_A
+print(f'Effective batch size: {BATCH_SIZE_A * GRAD_ACCUM_A}') # Changed BATCH_SIZE * GRAD_ACCUM to BATCH_SIZE_A * GRAD_ACCUM_A
+
+while step < MAX_STEPS_A: # Changed MAX_STEPS to MAX_STEPS_A
+    for batch in train_loader:
+        if step >= MAX_STEPS_A: # Changed MAX_STEPS to MAX_STEPS_A
+            break
+
+        mel, ids, mask = [x.to(device) for x in batch]
+
+        with torch.cuda.amp.autocast(enabled=FP16):
+            loss = forward_pass(mel, ids, mask) / GRAD_ACCUM_A # Changed GRAD_ACCUM to GRAD_ACCUM_A
+
+        scaler.scale(loss).backward()
+        accum_step   += 1
+        running_loss += loss.item()
+
+        if accum_step == GRAD_ACCUM_A: # Changed GRAD_ACCUM to GRAD_ACCUM_A
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+            accum_step = 0
+            step      += 1
+
+            if step % LOG_EVERY_A == 0: # Changed LOG_EVERY to LOG_EVERY_A
+                avg = running_loss / LOG_EVERY_A # Changed LOG_EVERY to LOG_EVERY_A
+                writer.add_scalar('train/loss', avg, step)
+                writer.add_scalar('train/lr', scheduler.get_last_lr()[0] * LR_A, step) # Changed LR to LR_A
+                print(f'step {step:>6}/{MAX_STEPS_A} | loss={avg:.4f} | ' # Changed MAX_STEPS to MAX_STEPS_A
+                      f'lr={scheduler.get_last_lr()[0]*LR_A:.2e}') # Changed LR to LR_A
+                running_loss = 0.0
+
+            if step % SAVE_EVERY_A == 0: # Changed SAVE_EVERY to SAVE_EVERY_A
+                adapter.eval(); llm.eval()
+                val_loss = 0.0; n = 0
+                with torch.no_grad():
+                    for vb in val_loader:
+                        vm, vi, vk = [x.to(device) for x in vb]
+                        with torch.cuda.amp.autocast(enabled=FP16):
+                            val_loss += forward_pass(vm, vi, vk).item()
+                        n += 1
+                val_loss /= n
+                writer.add_scalar('val/loss', val_loss, step)
+                print(f'\n>>> VAL step {step} | loss={val_loss:.4f}')
+
+                ckpt = {
+                    'step'          : step,
+                    'adapter_state' : adapter.state_dict(),
+                    'lora_state'    : llm.state_dict(),
+                    'optimizer_state': optimizer.state_dict(),
+                    'val_loss'      : val_loss,
+                }
+                torch.save(ckpt, f'{OUTPUT_DIR_A}/ckpt_step{step}.pt') # Changed OUTPUT_DIR to OUTPUT_DIR_A
+                if val_loss < best_val:
+                    best_val = val_loss
+                    torch.save(ckpt, f'{OUTPUT_DIR_A}/best.pt') # Changed OUTPUT_DIR to OUTPUT_DIR_A
+                    print(f'  ↳ New best: {best_val:.4f}')
+
+                adapter.train(); llm.train()
+
+writer.close()
+print(f'\nStage A complete. Best val loss: {best_val:.4f}')
+
+"""##Cell 12 — Interpret results"""
+
+best = torch.load(f'{OUTPUT_DIR_A}/best.pt', map_location=device) # Changed OUTPUT_DIR to OUTPUT_DIR_A
+print(f'Best val loss : {best["val_loss"]:.4f}  at step {best["step"]}')
+print()
+print('Loss interpretation:')
+print('  > 4.0  → adapter not converging, check forward_pass shapes')
+print('  2.5-4.0 → learning but needs more steps')
+print('  1.5-2.5 → good alignment, ready for Stage B')
+print('  < 1.5  → excellent, LLM strongly conditioned on audio')

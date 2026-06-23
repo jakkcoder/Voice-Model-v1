@@ -1,0 +1,23 @@
+# Environment and secrets
+.env
+.venv/
+.python-version
+
+# OS and caches
+.DS_Store
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Data and artifacts
+LJSpeech-1.1/
+LJSpeech-1.1.tar.bz2
+encoder_v2_checkpoints/
+stage_a_checkpoints/
+saved_models/
+*.pt
+*.log
+
+# IDE
+.idea/
+.vscode/

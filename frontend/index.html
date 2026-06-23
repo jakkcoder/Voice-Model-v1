@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Voice Encoder — Test Your Model</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d26;
+    --surface2: #22263a;
+    --accent: #7c6af7;
+    --accent2: #a78bfa;
+    --green: #34d399;
+    --red: #f87171;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --border: #2e3348;
+    --radius: 12px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 32px 16px 64px;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 40px;
+  }
+  header h1 {
+    font-size: 2rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--accent2), #60a5fa);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -0.5px;
+  }
+  header p {
+    color: var(--muted);
+    margin-top: 8px;
+    font-size: 0.95rem;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    width: 100%;
+    max-width: 760px;
+    margin-bottom: 20px;
+  }
+  .card h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--accent2);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* ── Mic recorder ── */
+  .rec-controls {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+    user-select: none;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-record { background: var(--accent); color: #fff; }
+  .btn-stop   { background: var(--red);    color: #fff; }
+  .btn-encode { background: var(--green);  color: #111; }
+  .btn-upload { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+
+  .rec-status {
+    font-size: 0.85rem;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .rec-dot {
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: var(--red);
+    display: none;
+    animation: pulse 1s infinite;
+  }
+  .rec-dot.active { display: inline-block; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.25; }
+  }
+
+  audio { width: 100%; margin-top: 16px; border-radius: 8px; outline: none; }
+
+  /* ── Waveform canvas ── */
+  #waveform-canvas {
+    width: 100%;
+    height: 80px;
+    background: var(--surface2);
+    border-radius: 8px;
+    margin-top: 16px;
+    display: none;
+  }
+
+  /* ── File upload zone ── */
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 32px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color: var(--accent);
+    background: rgba(124, 106, 247, 0.05);
+    color: var(--text);
+  }
+  .drop-zone input { display: none; }
+  .drop-zone .file-name {
+    margin-top: 10px;
+    color: var(--accent2);
+    font-size: 0.85rem;
+    word-break: break-all;
+  }
+
+  /* ── Encode button row ── */
+  .encode-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }
+  .spinner {
+    width: 18px; height: 18px;
+    border: 2px solid rgba(255,255,255,0.2);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    display: none;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Results ── */
+  #result-card { display: none; }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .stat-box {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 14px;
+  }
+  .stat-box .label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .stat-box .value { font-size: 1.3rem; font-weight: 700; color: var(--accent2); margin-top: 4px; }
+
+  /* ── Heatmap ── */
+  #heatmap-wrap {
+    position: relative;
+    margin-bottom: 20px;
+  }
+  #heatmap-wrap h3 { font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }
+  #heatmap-canvas {
+    width: 100%;
+    height: 140px;
+    border-radius: 8px;
+    display: block;
+    image-rendering: pixelated;
+  }
+
+  /* ── Speaker vector bar chart ── */
+  #vec-chart-wrap h3 { font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }
+  #vec-canvas {
+    width: 100%;
+    height: 100px;
+    border-radius: 8px;
+    display: block;
+  }
+
+  /* ── JSON output ── */
+  details { margin-top: 16px; }
+  summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--muted);
+    user-select: none;
+    padding: 6px 0;
+  }
+  summary:hover { color: var(--text); }
+  pre#json-out {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 16px;
+    font-size: 0.78rem;
+    overflow-x: auto;
+    max-height: 280px;
+    color: #a5b4fc;
+    margin-top: 8px;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  /* ── Error ── */
+  #error-box {
+    display: none;
+    background: rgba(248,113,113,0.1);
+    border: 1px solid var(--red);
+    border-radius: 8px;
+    padding: 14px;
+    color: var(--red);
+    font-size: 0.88rem;
+    margin-top: 12px;
+  }
+
+  .tag {
+    display: inline-block;
+    background: rgba(124,106,247,0.15);
+    color: var(--accent2);
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Voice Encoder</h1>
+  <p>Feed your voice — inspect the latent embeddings from your custom speech encoder</p>
+</header>
+
+<!-- ── Step 1 : record or upload ── -->
+<div class="card" id="input-card">
+  <h2>🎙 Step 1 — Record Your Voice</h2>
+
+  <div class="rec-controls">
+    <button class="btn btn-record" id="btn-start">&#9210; Start Recording</button>
+    <button class="btn btn-stop"   id="btn-stop" disabled>&#9632; Stop</button>
+    <span class="rec-status">
+      <span class="rec-dot" id="rec-dot"></span>
+      <span id="rec-label">Idle</span>
+    </span>
+  </div>
+
+  <canvas id="waveform-canvas"></canvas>
+  <audio id="preview-audio" controls style="display:none"></audio>
+</div>
+
+<div class="card">
+  <h2>📂 Step 1 (alt) — Upload an Audio File</h2>
+  <div class="drop-zone" id="drop-zone">
+    <input type="file" id="file-input" accept=".wav,.mp3,.ogg,.flac,.m4a,.webm" />
+    <div>Drop a file here or <strong>click to browse</strong></div>
+    <div>Supported: WAV · MP3 · OGG · FLAC · M4A · WebM</div>
+    <div class="file-name" id="file-name"></div>
+  </div>
+</div>
+
+<!-- ── Step 2 : encode ── -->
+<div class="card">
+  <h2>⚡ Step 2 — Run Encoder</h2>
+  <div class="encode-row">
+    <button class="btn btn-encode" id="btn-encode" disabled>&#9654; Encode Audio</button>
+    <div class="spinner" id="spinner"></div>
+    <span id="enc-status" style="font-size:0.85rem;color:var(--muted)"></span>
+  </div>
+  <div id="error-box"></div>
+</div>
+
+<!-- ── Step 3 : results ── -->
+<div class="card" id="result-card">
+  <h2>📊 Step 3 — Results <span class="tag" id="device-tag"></span></h2>
+
+  <div class="stats-grid">
+    <div class="stat-box">
+      <div class="label">Duration</div>
+      <div class="value" id="stat-dur">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Frames (T)</div>
+      <div class="value" id="stat-frames">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Embedding Dim</div>
+      <div class="value" id="stat-dim">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Total Values</div>
+      <div class="value" id="stat-total">—</div>
+    </div>
+  </div>
+
+  <div id="heatmap-wrap">
+    <h3>Frame-level Embeddings Heatmap  (T × 768, first 64 dims shown)</h3>
+    <canvas id="heatmap-canvas"></canvas>
+  </div>
+
+  <div id="vec-chart-wrap">
+    <h3>Speaker Vector  (mean-pooled, L2-normalised, 768 dims)</h3>
+    <canvas id="vec-canvas"></canvas>
+  </div>
+
+  <details>
+    <summary>▶ Show raw JSON response</summary>
+    <pre id="json-out"></pre>
+  </details>
+</div>
+
+<script>
+/* ────────────────────────────────────────────────────────────────────────────
+   Globals
+─────────────────────────────────────────────────────────────────────────────*/
+const API_BASE = '';   // same origin; change to 'http://localhost:8000' if needed
+
+let audioBlob    = null;  // from mic (WAV)
+let uploadedFile = null;  // from file picker
+
+/* ────────────────────────────────────────────────────────────────────────────
+   WAV encoder helpers
+   We capture raw PCM via AudioContext and pack it into a proper WAV file.
+   This avoids WebM/Opus which requires ffmpeg or TorchCodec to decode.
+─────────────────────────────────────────────────────────────────────────────*/
+
+/** Pack a Float32Array of mono PCM samples into a 16-bit PCM WAV Blob. */
+function pcmToWav(samples, sampleRate) {
+  const numSamples = samples.length;
+  const buf = new ArrayBuffer(44 + numSamples * 2);
+  const view = new DataView(buf);
+  const write = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+
+  write(0,  'RIFF');
+  view.setUint32(4,  36 + numSamples * 2, true);
+  write(8,  'WAVE');
+  write(12, 'fmt ');
+  view.setUint32(16, 16,         true);   // PCM subchunk size
+  view.setUint16(20, 1,          true);   // PCM format
+  view.setUint16(22, 1,          true);   // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2,          true);   // block align
+  view.setUint16(34, 16,         true);   // bits per sample
+  write(36, 'data');
+  view.setUint32(40, numSamples * 2, true);
+
+  let off = 44;
+  for (let i = 0; i < numSamples; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    off += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   Mic recording with live waveform
+─────────────────────────────────────────────────────────────────────────────*/
+const btnStart   = document.getElementById('btn-start');
+const btnStop    = document.getElementById('btn-stop');
+const recDot     = document.getElementById('rec-dot');
+const recLabel   = document.getElementById('rec-label');
+const previewAud = document.getElementById('preview-audio');
+const wfCanvas   = document.getElementById('waveform-canvas');
+const wfCtx      = wfCanvas.getContext('2d');
+
+let animId        = null;
+let analyser      = null;
+let audioCtx      = null;
+let micStream     = null;
+let scriptNode    = null;
+let pcmChunks     = [];   // Float32Array chunks collected during recording
+const REC_SR      = 22050; // record at model's native sample rate
+
+function drawWaveform() {
+  if (!analyser) return;
+  animId = requestAnimationFrame(drawWaveform);
+  const buf = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(buf);
+  const W = wfCanvas.clientWidth; const H = wfCanvas.clientHeight;
+  wfCanvas.width = W; wfCanvas.height = H;
+  wfCtx.clearRect(0, 0, W, H);
+  wfCtx.strokeStyle = '#7c6af7';
+  wfCtx.lineWidth = 2;
+  wfCtx.beginPath();
+  const slice = W / buf.length;
+  let x = 0;
+  buf.forEach((v, i) => {
+    const y = (v / 128.0) * (H / 2);
+    i === 0 ? wfCtx.moveTo(x, y) : wfCtx.lineTo(x, y);
+    x += slice;
+  });
+  wfCtx.stroke();
+}
+
+btnStart.addEventListener('click', async () => {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    // Create AudioContext at the model's native sample rate so no resampling needed
+    audioCtx = new AudioContext({ sampleRate: REC_SR });
+    const src = audioCtx.createMediaStreamSource(micStream);
+
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    src.connect(analyser);
+
+    // ScriptProcessorNode captures raw PCM
+    scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    pcmChunks  = [];
+    scriptNode.onaudioprocess = e => {
+      pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    };
+    src.connect(scriptNode);
+    scriptNode.connect(audioCtx.destination);
+
+    wfCanvas.style.display = 'block';
+    drawWaveform();
+    recDot.classList.add('active');
+    recLabel.textContent = 'Recording…';
+    btnStart.disabled = true;
+    btnStop.disabled  = false;
+  } catch (err) {
+    showError('Microphone access denied: ' + err.message);
+  }
+});
+
+btnStop.addEventListener('click', () => {
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (micStream)  { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (audioCtx)   { audioCtx.close(); audioCtx = null; }
+  cancelAnimationFrame(animId); animId = null; analyser = null;
+
+  // Merge all PCM chunks → WAV blob
+  const totalLen = pcmChunks.reduce((s, c) => s + c.length, 0);
+  const merged   = new Float32Array(totalLen);
+  let offset = 0;
+  for (const chunk of pcmChunks) { merged.set(chunk, offset); offset += chunk.length; }
+  audioBlob = pcmToWav(merged, REC_SR);
+
+  previewAud.src = URL.createObjectURL(audioBlob);
+  previewAud.style.display = 'block';
+  uploadedFile = null;
+  document.getElementById('file-name').textContent = '';
+  setEncodeReady(true);
+
+  wfCanvas.style.display = 'none';
+  recDot.classList.remove('active');
+  recLabel.textContent = 'Done — preview below';
+  btnStart.disabled = false;
+  btnStop.disabled  = true;
+});
+
+/* ────────────────────────────────────────────────────────────────────────────
+   File upload / drag-and-drop
+─────────────────────────────────────────────────────────────────────────────*/
+const dropZone  = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const fileName  = document.getElementById('file-name');
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const f = e.dataTransfer.files[0];
+  if (f) handleFile(f);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) handleFile(fileInput.files[0]);
+});
+
+function handleFile(f) {
+  uploadedFile = f;
+  audioBlob    = null;
+  fileName.textContent = f.name;
+  previewAud.src = URL.createObjectURL(f);
+  previewAud.style.display = 'block';
+  setEncodeReady(true);
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   Encode
+─────────────────────────────────────────────────────────────────────────────*/
+const btnEncode  = document.getElementById('btn-encode');
+const spinner    = document.getElementById('spinner');
+const encStatus  = document.getElementById('enc-status');
+
+function setEncodeReady(ready) {
+  btnEncode.disabled = !ready;
+}
+
+btnEncode.addEventListener('click', async () => {
+  hideError();
+  const source = uploadedFile || audioBlob;
+  if (!source) { showError('No audio source. Record or upload first.'); return; }
+
+  const formData = new FormData();
+  const name = uploadedFile ? uploadedFile.name : 'recording.wav';
+  formData.append('file', source instanceof File ? source : new File([source], name, { type: 'audio/wav' }), name);
+
+  btnEncode.disabled = true;
+  spinner.style.display = 'inline-block';
+  encStatus.textContent = 'Running inference…';
+  document.getElementById('result-card').style.display = 'none';
+
+  try {
+    const res = await fetch(`${API_BASE}/encode`, { method: 'POST', body: formData });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || res.statusText);
+    }
+    const data = await res.json();
+    renderResults(data);
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    spinner.style.display = 'none';
+    btnEncode.disabled = false;
+    encStatus.textContent = '';
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────────────────
+   Results rendering
+─────────────────────────────────────────────────────────────────────────────*/
+function renderResults(data) {
+  const card = document.getElementById('result-card');
+  card.style.display = 'block';
+  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  const [T, D] = data.shape;
+  document.getElementById('stat-dur').textContent    = data.duration_s.toFixed(2) + ' s';
+  document.getElementById('stat-frames').textContent  = T;
+  document.getElementById('stat-dim').textContent     = D;
+  document.getElementById('stat-total').textContent   = (T * D).toLocaleString();
+  document.getElementById('device-tag').textContent   = data.device;
+
+  drawHeatmap(data.embeddings, T, D);
+  drawSpeakerVec(data.speaker_vector);
+
+  // JSON preview (truncated for readability)
+  const preview = {
+    shape: data.shape,
+    duration_s: data.duration_s,
+    device: data.device,
+    speaker_vector_first8: data.speaker_vector.slice(0, 8).map(v => +v.toFixed(5)),
+    embeddings_first_frame_first8: data.embeddings[0].slice(0, 8).map(v => +v.toFixed(5)),
+    note: 'Full embeddings omitted for brevity. See /encode response for all values.',
+  };
+  document.getElementById('json-out').textContent = JSON.stringify(preview, null, 2);
+}
+
+/* Heatmap — show first 64 dimensions */
+function drawHeatmap(embeddings, T, D) {
+  const canvas = document.getElementById('heatmap-canvas');
+  const SHOW_D = Math.min(64, D);
+  canvas.width  = T;
+  canvas.height = SHOW_D;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(T, SHOW_D);
+
+  // Flatten relevant slice
+  let min = Infinity, max = -Infinity;
+  for (let t = 0; t < T; t++) {
+    for (let d = 0; d < SHOW_D; d++) {
+      const v = embeddings[t][d];
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+  }
+  const range = max - min || 1;
+
+  for (let t = 0; t < T; t++) {
+    for (let d = 0; d < SHOW_D; d++) {
+      const norm = (embeddings[t][d] - min) / range;  // 0..1
+      const [r, g, b] = viridis(norm);
+      const idx = (d * T + t) * 4;
+      img.data[idx]   = r;
+      img.data[idx+1] = g;
+      img.data[idx+2] = b;
+      img.data[idx+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+/* Speaker vector bar chart */
+function drawSpeakerVec(vec) {
+  const canvas = document.getElementById('vec-canvas');
+  const W = canvas.clientWidth || 700;
+  const H = 100;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  const N = vec.length;
+  const barW = Math.max(1, W / N);
+  const mid = H / 2;
+
+  ctx.fillStyle = 'rgba(124,106,247,0.25)';
+  ctx.fillRect(0, 0, W, H);
+
+  for (let i = 0; i < N; i++) {
+    const v = vec[i];  // already normalised -1..1 ish
+    const barH = Math.abs(v) * mid;
+    const y = v >= 0 ? mid - barH : mid;
+    const t = (i / N);
+    ctx.fillStyle = `hsl(${220 + t * 80}, 80%, 65%)`;
+    ctx.fillRect(i * barW, y, barW, barH);
+  }
+  // centre line
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(W, mid); ctx.stroke();
+}
+
+/* Viridis-like colour map (simplified) */
+function viridis(t) {
+  // Approximate Viridis: purple → blue → green → yellow
+  const r = Math.round(255 * Math.min(1, Math.max(0, 0.28 + t * 0.72)));
+  const g = Math.round(255 * Math.min(1, Math.max(0, t)));
+  const b = Math.round(255 * Math.min(1, Math.max(0, 0.8 - t * 0.8)));
+  return [r, g, b];
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+   Error helpers
+─────────────────────────────────────────────────────────────────────────────*/
+function showError(msg) {
+  const box = document.getElementById('error-box');
+  box.style.display = 'block';
+  box.textContent = '⚠ ' + msg;
+}
+function hideError() {
+  document.getElementById('error-box').style.display = 'none';
+}
+</script>
+</body>
+</html>

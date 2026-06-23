@@ -1,17 +1,22 @@
 accelerate==1.13.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
 bitsandbytes==0.49.2
 datasets==4.0.0
 # evaluate (version not found or not installed)
 # jiwer (version not found or not installed)
-kaggle==2.0.2
+kaggle
 librosa==0.11.0
 matplotlib==3.10.0
 numpy==2.0.2
 pandas==2.2.2
 peft==0.19.1
 seaborn==0.13.2
+scikit-learn
 soundfile==0.14.0
 tensorboard==2.20.0
-torchaudio==2.11.0+cu128
+torchaudio==2.11.0
+tqdm
 # torchinfo (version not found or not installed)
 transformers==5.10.2
