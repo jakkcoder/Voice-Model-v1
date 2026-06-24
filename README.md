@@ -1,145 +1,229 @@
------------------------------------------------------------------------------
-The LJ Speech Dataset
+# Voice-Model-v1
 
-Version 1.0
-July 5, 2017
-https://keithito.com/LJ-Speech-Dataset
------------------------------------------------------------------------------
+Speech-to-LLM voice agent pipeline: custom speech encoder → ModalityAdapter → SmolLM2-1.7B (LoRA).
 
+**Repository:** https://github.com/jakkcoder/Voice-Model-v1
 
-OVERVIEW
+---
 
-This is a public domain speech dataset consisting of 13,100 short audio clips
-of a single speaker reading passages from 7 non-fiction books. A transcription
-is provided for each clip. Clips vary in length from 1 to 10 seconds and have
-a total length of approximately 24 hours.
+## Project layout
 
-The texts were published between 1884 and 1964, and are in the public domain.
-The audio was recorded in 2016-17 by the LibriVox project and is also in the
-public domain.
+```
+Voice-Model-v1/
+├── train_encoder.py          # Stage 0: train custom speech encoder
+├── train_stage_a.py          # Stage A: adapter + SmolLM2 LoRA (main training script)
+├── custom_encoder_v2.py        # Encoder notebook/script (v2)
+├── custom_encoder_v3.py        # Full pipeline notebook export (Colab-style)
+├── api.py                      # FastAPI inference server
+├── frontend/index.html         # Web UI
+│
+├── scripts/
+│   ├── run_stage_a_native.sh   # Train on Mac MPS (recommended)
+│   └── run_stage_a_docker.sh   # Train in Docker (CPU only on Mac)
+│
+├── fleet/
+│   ├── sync_s3.sh              # Pull/push artifacts from shared S3 bucket
+│   ├── s3_manifest.json        # S3 path reference
+│   └── job_state.json          # Distributed training progress tracker
+│
+├── Dockerfile.train            # Docker image for Stage A
+├── pyproject.toml              # Python dependencies
+├── train.csv                   # Training manifest (paths + transcripts)
+├── val.csv                     # Validation manifest
+│
+├── LJSpeech-1.1/               # Audio dataset (local only, not in git)
+│   └── wavs/                   # .wav files referenced by train.csv
+│
+├── encoder_v2_checkpoints/     # Stage 0 encoder weights (local / S3)
+│   └── custom_encoder_v2.pt
+│
+└── stage_a_checkpoints/        # Stage A checkpoints (local / S3)
+    ├── latest.pt               # Saved on Ctrl+C / docker stop
+    ├── ckpt_step1500.pt        # Periodic checkpoint (every 1500 steps)
+    ├── best.pt                 # Best validation loss
+    └── tb_logs/                # TensorBoard logs
+```
 
+---
 
+## What lives where
 
-FILE FORMAT
+| Item | Git | S3 | Local only |
+|------|-----|----|----|
+| Source code (`train_*.py`, `scripts/`) | Yes | — | — |
+| `train.csv`, `val.csv` | Yes | Yes | — |
+| `custom_encoder_v2.pt` (encoder) | No | Yes | Yes |
+| Stage A checkpoints (`*.pt`) | No | Yes | Yes |
+| `LJSpeech-1.1/` audio (~3.6 GB) | No | No | Yes (download) |
+| `.env`, `.venv/`, logs | No | No | Yes |
+| TensorBoard logs | No | No | Yes |
 
-Metadata is provided in metadata.csv. This file consists of one record per
-line, delimited by the pipe character (0x7c). The fields are:
+---
 
-  1. ID: this is the name of the corresponding .wav file
-  2. Transcription: words spoken by the reader (UTF-8)
-  3. Normalized Transcription: transcription with numbers, ordinals, and
-     monetary units expanded into full words (UTF-8).
+## Shared S3 bucket (team artifacts)
 
-Each audio file is a single-channel 16-bit PCM WAV with a sample rate of
-22050 Hz.
+| | |
+|---|---|
+| **Bucket** | `voice-model-v1-fleet-079984577428` |
+| **Region** | `us-east-1` |
+| **Prefix** | `voice-model-v1/` |
 
+### S3 paths
 
+| File | S3 key |
+|------|--------|
+| Encoder checkpoint | `voice-model-v1/encoder_v2_checkpoints/custom_encoder_v2.pt` |
+| Train manifest | `voice-model-v1/data/train.csv` |
+| Val manifest | `voice-model-v1/data/val.csv` |
+| Stage A checkpoints | `voice-model-v1/stage_a_checkpoints/` |
+| Fleet job state | `voice-model-v1/fleet/job_state.json` |
+| Path manifest | `voice-model-v1/fleet/s3_manifest.json` |
 
-STATISTICS
+**Console:** https://s3.console.aws.amazon.com/s3/buckets/voice-model-v1-fleet-079984577428
 
-Total Clips            13,100
-Total Words            225,715
-Total Characters       1,308,674
-Total Duration         23:55:17
-Mean Clip Duration     6.57 sec
-Min Clip Duration      1.11 sec
-Max Clip Duration      10.10 sec
-Mean Words per Clip    17.23
-Distinct Words         13,821
+---
 
+## Setup
 
+### 1. Clone and install
 
-MISCELLANEOUS
+```bash
+git clone git@github.com:jakkcoder/Voice-Model-v1.git
+cd Voice-Model-v1
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
 
-The audio clips range in length from approximately 1 second to 10 seconds.
-They were segmented automatically based on silences in the recording. Clip
-boundaries generally align with sentence or clause boundaries, but not always.
+### 2. Download LJSpeech (local, required for training)
 
-The text was matched to the audio manually, and a QA pass was done to ensure
-that the text accurately matched the words spoken in the audio.
+```bash
+wget https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2
+tar -xjf LJSpeech-1.1.tar.bz2
+```
 
-The original LibriVox recordings were distributed as 128 kbps MP3 files. As a
-result, they may contain artifacts introduced by the MP3 encoding.
+Dataset info: https://keithito.com/LJ-Speech-Dataset/
 
-The following abbreviations appear in the text. They may be expanded as
-follows:
+### 3. Pull shared artifacts from S3
 
-     Abbreviation   Expansion
-     --------------------------
-     Mr.            Mister
-     Mrs.           Misess (*)
-     Dr.            Doctor
-     No.            Number
-     St.            Saint
-     Co.            Company
-     Jr.            Junior
-     Maj.           Major
-     Gen.           General
-     Drs.           Doctors
-     Rev.           Reverend
-     Lt.            Lieutenant
-     Hon.           Honorable
-     Sgt.           Sergeant
-     Capt.          Captain
-     Esq.           Esquire
-     Ltd.           Limited
-     Col.           Colonel
-     Ft.            Fort
+Requires AWS credentials with read access to the bucket.
 
-     * there's no standard expansion of "Mrs."
+```bash
+./fleet/sync_s3.sh pull
+```
 
+This downloads encoder weights, CSVs, and Stage A checkpoints into the local paths listed above.
 
-19 of the transcriptions contain non-ASCII characters (for example, LJ016-0257
-contains "raison d'être").
+### 4. Verify Apple GPU (Mac)
 
-For more information or to report errors, please email kito@kito.us.
+```bash
+python -c "import torch; print('MPS:', torch.backends.mps.is_available())"
+```
 
+---
 
+## Training
 
-LICENSE
+### Stage 0 — Speech encoder
 
-This dataset is in the public domain in the USA (and likely other countries as
-well). There are no restrictions on its use. For more information, please see:
-https://librivox.org/pages/public-domain.
+```bash
+python train_encoder.py
+# Output: encoder_v2_checkpoints/custom_encoder_v2.pt
+```
 
+### Stage A — Adapter + SmolLM2 LoRA (recommended: native MPS)
 
-CHANGELOG
+```bash
+./scripts/run_stage_a_native.sh
+```
 
-* 1.0 (July 8, 2017):
-  Initial release
+| Setting | Value |
+|---------|-------|
+| Target steps | 15,000 |
+| Checkpoint every | 1,500 steps |
+| Effective batch size | 8 (batch 2 × grad accum 4 on Mac) |
+| Output dir | `stage_a_checkpoints/` |
 
-* 1.1 (Feb 19, 2018):
-  Version 1.0 included 30 .wav files with no corresponding annotations in
-  metadata.csv. These have been removed in version 1.1. Thanks to Rafael Valle
-  for spotting this.
+**Pause:** Ctrl+C → saves `stage_a_checkpoints/latest.pt`
 
+**Resume:**
 
-CREDITS
+```bash
+RESUME=stage_a_checkpoints/ckpt_step1500.pt ./scripts/run_stage_a_native.sh
+```
 
-This dataset consists of excerpts from the following works:
+**Upload new checkpoints to S3 after a session:**
 
-* Morris, William, et al. Arts and Crafts Essays. 1893.
-* Griffiths, Arthur. The Chronicles of Newgate, Vol. 2. 1884.
-* Roosevelt, Franklin D. The Fireside Chats of Franklin Delano Roosevelt.
-  1933-42.
-* Harland, Marion. Marion Harland's Cookery for Beginners. 1893.
-* Rolt-Wheeler, Francis. The Science - History of the Universe, Vol. 5:
-  Biology. 1910.
-* Banks, Edgar J. The Seven Wonders of the Ancient World. 1916.
-* President's Commission on the Assassination of President Kennedy. Report
-  of the President's Commission on the Assassination of President Kennedy.
-  1964.
+```bash
+./fleet/sync_s3.sh push-checkpoints
+./fleet/sync_s3.sh push-state
+```
 
-Recordings by Linda Johnson. Alignment and annotation by Keith Ito. All text,
-audio, and annotations are in the public domain.
+### Stage A — Docker (optional, CPU only on Mac)
 
-There's no requirement to cite this work, but if you'd like to do so, you can
-link to: https://keithito.com/LJ-Speech-Dataset
+Docker on Mac cannot use Apple MPS. Use only if you need hard RAM/CPU caps.
 
-or use the following:
-@misc{ljspeech17,
-  author       = {Keith Ito},
-  title        = {The LJ Speech Dataset},
-  howpublished = {\url{https://keithito.com/LJ-Speech-Dataset/}},
-  year         = 2017
-}
+```bash
+./scripts/run_stage_a_docker.sh
+# Detached: BUILD=0 DETACH=1 ./scripts/run_stage_a_docker.sh
+```
+
+---
+
+## Distributed training (Mac fleet over VPN)
+
+Training uses **checkpoint handoff**, not synced multi-GPU DDP, so teammates can join and leave anytime.
+
+1. Each MacBook: VPN + SSH + clone repo + `./fleet/sync_s3.sh pull` + LJSpeech locally
+2. When available: run `./scripts/run_stage_a_native.sh` with `--resume` from latest S3 checkpoint
+3. After session: `./fleet/sync_s3.sh push-checkpoints`
+4. Coordinator tracks progress in `fleet/job_state.json`
+
+See `fleet/s3_manifest.json` for all S3 paths.
+
+---
+
+## Inference API
+
+```bash
+uvicorn api:app --reload
+# Frontend: open frontend/index.html
+```
+
+---
+
+## Loss interpretation (Stage A)
+
+| Val loss | Meaning |
+|----------|---------|
+| > 4.0 | Adapter not converging |
+| 2.5–4.0 | Learning, may need more steps |
+| 1.5–2.5 | Good alignment, ready for Stage B |
+| < 1.5 | Strong audio conditioning |
+
+---
+
+## Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `HF_TOKEN` | Faster HuggingFace downloads |
+| `RESUME` | Checkpoint path for `run_stage_a_native.sh` / docker script |
+| `S3_BUCKET` | Override bucket in `fleet/sync_s3.sh` (default: `voice-model-v1-fleet-079984577428`) |
+| `S3_PREFIX` | Override S3 prefix (default: `voice-model-v1`) |
+| `TRAIN_NUM_THREADS` | CPU thread limit for training |
+| `RESERVED_CPUS` / `RESERVED_MEM_GB` | Headroom left for macOS in run scripts |
+
+---
+
+## Logs
+
+| File | Description |
+|------|-------------|
+| `stage_a_training.log` | Stage A training output (appended) |
+| `encoder_training.log` | Encoder training output |
+| `stage_a_checkpoints/tb_logs/` | TensorBoard metrics |
+
+```bash
+tensorboard --logdir stage_a_checkpoints/tb_logs
+```
