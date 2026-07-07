@@ -27,6 +27,7 @@ Original file is located at
 """## 2. Config — all hyperparameters in one place"""
 
 import torch
+from pathlib import Path
 
 # ── Audio ──────────────────────────────────────────────────────────────────
 MEL_SR       = 22050
@@ -72,13 +73,25 @@ TEMP         = 0.07           # InfoNCE temperature
 DATA_ROOT    = 'LJSpeech-1.1'
 TRAIN_CSV    = 'train.csv'
 VAL_CSV      = 'val.csv'
-OUTPUT_DIR   = '.'
+OUTPUT_DIR   = 'encoder_v2_checkpoints'
+OUTPUT_DIR_A = 'stage_a_checkpoints'
+ENCODER_EXPORT = Path(OUTPUT_DIR) / 'custom_encoder_v2.pt'
+STAGE_A_BEST = Path(OUTPUT_DIR_A) / 'best.pt'
+SKIP_ENCODER_TRAIN = ENCODER_EXPORT.exists()
+SKIP_STAGE_A_TRAIN = STAGE_A_BEST.exists()
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'Device: {device}')
 if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
+FP16 = device.type == 'cuda'
+print(f'Device: {device}')
+if device.type == 'cuda':
     print(f'GPU: {torch.cuda.get_device_name(0)}')
     print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+print(f'Skip encoder train: {SKIP_ENCODER_TRAIN} | Skip Stage A train: {SKIP_STAGE_A_TRAIN}')
 print(f'MAX_MEL_LEN: {MAX_MEL_LEN}')
 print(f'VOCAB_SIZE: {VOCAB_SIZE}')
 
@@ -98,19 +111,54 @@ MAX_STEPS_A      = 15000
 SAVE_EVERY_A     = 1500
 LOG_EVERY_A      = 50
 MAX_TEXT_LEN     = 128
-OUTPUT_DIR_A     = 'stage_a_checkpoints'
+
+import os
+import sys
+
+# Set SKIP_ALL_TRAINING=0 to run the full notebook pipeline (encoder + Stage A training).
+SKIP_ALL_TRAINING = os.environ.get("SKIP_ALL_TRAINING", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def interpret_stage_a_results() -> None:
+    """Cell 12 — load best.pt and print Stage A loss interpretation."""
+    if not STAGE_A_BEST.exists():
+        raise FileNotFoundError(
+            f"Stage A checkpoint not found: {STAGE_A_BEST}\n"
+            "Run train_stage_a.py first, or set SKIP_ALL_TRAINING=0 for full pipeline."
+        )
+    best = torch.load(STAGE_A_BEST, map_location=device, weights_only=False)
+    print(f'Best val loss : {best["val_loss"]:.4f}  at step {best["step"]}')
+    print()
+    print("Loss interpretation:")
+    print("  > 4.0  → adapter not converging, check forward_pass shapes")
+    print("  2.5-4.0 → learning but needs more steps")
+    print("  1.5-2.5 → good alignment, ready for Stage B")
+    print("  < 1.5  → excellent, LLM strongly conditioned on audio")
+
+
+if SKIP_ALL_TRAINING:
+    print("SKIP_ALL_TRAINING=1 — skipping training, running Cell 12 only")
+    interpret_stage_a_results()
+    sys.exit(0)
 
 """## 3. LJSpeech download + manifest (reuse your existing split if you have it)"""
 
-import os, pandas as pd
+import os, subprocess, pandas as pd
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 
 # ── Download if not present ─────────────────────────────────────────────────
 if not Path(DATA_ROOT).exists():
     print('Downloading LJSpeech...')
-    !wget -q https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2
-    !tar -xjf LJSpeech-1.1.tar.bz2
+    subprocess.run(
+        ['wget', '-q', 'https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2'],
+        check=True,
+    )
+    subprocess.run(['tar', '-xjf', 'LJSpeech-1.1.tar.bz2'], check=True)
     print('Done.')
 else:
     print('LJSpeech already present.')
@@ -140,6 +188,11 @@ else:
 import torch
 import torchaudio
 import torchaudio.transforms as T
+import soundfile as sf
+
+def load_wav(path: str) -> tuple[torch.Tensor, int]:
+    data, sr = sf.read(path, dtype='float32', always_2d=True)
+    return torch.from_numpy(data.T), sr
 
 # ── Mel transform ───────────────────────────────────────────────────────────
 # Instantiate MelSpectrogram on CPU to avoid CUDA multiprocessing issues in workers
@@ -174,6 +227,23 @@ def wav_to_mel(wav: torch.Tensor, orig_sr: int) -> torch.Tensor:
         mel = torch.nn.functional.pad(mel, (0, pad), value=-11.5)  # log(1e-5)
     return mel   # (N_MELS, MAX_MEL_LEN) - explicitly a CPU tensor
 
+
+def augment_mel(mel: torch.Tensor) -> torch.Tensor:
+    """Apply time + freq masking for a second view of the same utterance."""
+    mel = mel.clone()
+    t_len = mel.shape[-1]
+    t_mask = max(1, int(0.10 * t_len))
+    t0 = torch.randint(0, t_len - t_mask, (1,)).item()
+    mel[:, t0:t0 + t_mask] = -11.5
+    f_mask = torch.randint(1, 16, (1,)).item()
+    f0 = torch.randint(0, N_MELS - f_mask, (1,)).item()
+    mel[f0:f0 + f_mask, :] = -11.5
+    return mel
+
+
+def text_to_ids(text: str) -> list[int]:
+    return [VOCAB[c] for c in text.lower() if c in VOCAB]
+
 """## 5. Dataset"""
 
 import torchaudio
@@ -191,7 +261,7 @@ class LJSpeechEncoderDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        wav, sr = torchaudio.load(row['wav_path'])
+        wav, sr = load_wav(row['wav_path'])
 
         mel      = wav_to_mel(wav, sr)          # (N_MELS, MAX_MEL_LEN)
         mel_aug  = augment_mel(mel)             # augmented view for contrastive
@@ -218,10 +288,11 @@ def collate_fn(batch):
 train_ds = LJSpeechEncoderDataset(TRAIN_CSV)
 val_ds   = LJSpeechEncoderDataset(VAL_CSV)
 
+_enc_workers = 0 if device.type in {'mps', 'cpu'} else 2
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                          num_workers=2, collate_fn=collate_fn, pin_memory=True)
+                          num_workers=_enc_workers, collate_fn=collate_fn, pin_memory=False)
 val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                          num_workers=2, collate_fn=collate_fn, pin_memory=True)
+                          num_workers=_enc_workers, collate_fn=collate_fn, pin_memory=False)
 
 print(f'train: {len(train_ds)} | val: {len(val_ds)}')
 # quick shape check
@@ -432,7 +503,6 @@ with torch.no_grad():
 # CUSTOM SPEECH ENCODER — ARCHITECTURE SUMMARY
 
 import gc
-from torchinfo import summary
 
 gc.collect()
 if torch.cuda.is_available():
@@ -440,17 +510,21 @@ if torch.cuda.is_available():
 
 print("  CUSTOM SPEECH ENCODER v2 — ARCHITECTURE")
 
-# Print full torchinfo summary
-print(" Full Model Architecture:\n")
-summary(
-    model.encoder,
-    input_data=torch.randn(1, N_MELS, MAX_MEL_LEN).to(device),
-    col_names=["input_size", "output_size", "num_params", "trainable"],
-    col_width=20,
-    row_settings=["var_names"],
-    depth=4,
-    verbose=1,
-)
+try:
+    from torchinfo import summary
+
+    print(" Full Model Architecture:\n")
+    summary(
+        model.encoder,
+        input_data=torch.randn(1, N_MELS, MAX_MEL_LEN).to(device),
+        col_names=["input_size", "output_size", "num_params", "trainable"],
+        col_width=20,
+        row_settings=["var_names"],
+        depth=4,
+        verbose=1,
+    )
+except ImportError:
+    print(" (torchinfo not installed — skipping architecture summary)")
 
 
 print(" Component Breakdown:")
@@ -536,116 +610,125 @@ running       = {k: 0.0 for k in ['total','recon','ctc','contrast']}
 model.train()
 optimizer.zero_grad()
 
-print(f'Starting training for {MAX_STEPS} steps...')
-print(f'Effective batch size: {BATCH_SIZE * GRAD_ACCUM}')
+if SKIP_ENCODER_TRAIN:
+    print(f'Skipping encoder training — using {ENCODER_EXPORT}')
+    model.encoder.load_state_dict(
+        torch.load(ENCODER_EXPORT, map_location=device, weights_only=False)
+    )
+    model.encoder.eval()
+else:
+    print(f'Starting training for {MAX_STEPS} steps...')
+    print(f'Effective batch size: {BATCH_SIZE * GRAD_ACCUM}')
 
-epoch = 0
-while step < MAX_STEPS:
-    epoch += 1
-    for batch in train_loader:
-        if step >= MAX_STEPS:
-            break
+    epoch = 0
+    while step < MAX_STEPS:
+        epoch += 1
+        for batch in train_loader:
+            if step >= MAX_STEPS:
+                break
 
-        mel, mel_aug, label_ids, label_lens = [
-            x.to(device) for x in batch
-        ]
+            mel, mel_aug, label_ids, label_lens = [
+                x.to(device) for x in batch
+            ]
 
-        #  Forward + backward
-        with torch.cuda.amp.autocast(enabled=FP16):
-            loss, loss_dict = model(mel, mel_aug, label_ids, label_lens)
-            loss = loss / GRAD_ACCUM
+            #  Forward + backward
+            with torch.cuda.amp.autocast(enabled=FP16):
+                loss, loss_dict = model(mel, mel_aug, label_ids, label_lens)
+                loss = loss / GRAD_ACCUM
 
-        scaler.scale(loss).backward()
-        accum_step += 1
+            scaler.scale(loss).backward()
+            accum_step += 1
 
-        # Accumulate metrics
-        for k in running:
-            running[k] += loss_dict[k] / GRAD_ACCUM
+            # Accumulate metrics
+            for k in running:
+                running[k] += loss_dict[k] / GRAD_ACCUM
 
-        # Optimizer step
-        if accum_step == GRAD_ACCUM:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            optimizer.zero_grad()
-            accum_step = 0
-            step += 1
+            # Optimizer step
+            if accum_step == GRAD_ACCUM:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+                accum_step = 0
+                step += 1
 
-            # Logging
-            if step % LOG_EVERY == 0:
-                lr_now = scheduler.get_last_lr()[0] * LR
-                for k, v in running.items():
-                    writer.add_scalar(f'train/{k}', v / LOG_EVERY, step)
-                print(f'step {step:>6}/{MAX_STEPS} | '
-                      f'loss={running["total"]/LOG_EVERY:.4f} '
-                      f'recon={running["recon"]/LOG_EVERY:.4f} '
-                      f'ctc={running["ctc"]/LOG_EVERY:.4f} '
-                      f'contrast={running["contrast"]/LOG_EVERY:.4f} '
-                      f'lr={lr_now:.2e}')
-                running = {k: 0.0 for k in running}
+                # Logging
+                if step % LOG_EVERY == 0:
+                    lr_now = scheduler.get_last_lr()[0] * LR
+                    for k, v in running.items():
+                        writer.add_scalar(f'train/{k}', v / LOG_EVERY, step)
+                    print(f'step {step:>6}/{MAX_STEPS} | '
+                          f'loss={running["total"]/LOG_EVERY:.4f} '
+                          f'recon={running["recon"]/LOG_EVERY:.4f} '
+                          f'ctc={running["ctc"]/LOG_EVERY:.4f} '
+                          f'contrast={running["contrast"]/LOG_EVERY:.4f} '
+                          f'lr={lr_now:.2e}')
+                    running = {k: 0.0 for k in running}
 
-            # Validation + checkpoint
-            if step % SAVE_EVERY == 0:
-                model.eval()
-                val_losses = {k: 0.0 for k in ['total','recon','ctc','contrast']}
-                n_val = 0
-                with torch.no_grad():
-                    for vbatch in val_loader:
-                        vm, vma, vli, vll = [x.to(device) for x in vbatch]
-                        with torch.cuda.amp.autocast(enabled=FP16):
-                            _, vd = model(vm, vma, vli, vll)
-                        for k in val_losses:
-                            val_losses[k] += vd[k]
-                        n_val += 1
+                # Validation + checkpoint
+                if step % SAVE_EVERY == 0:
+                    model.eval()
+                    val_losses = {k: 0.0 for k in ['total','recon','ctc','contrast']}
+                    n_val = 0
+                    with torch.no_grad():
+                        for vbatch in val_loader:
+                            vm, vma, vli, vll = [x.to(device) for x in vbatch]
+                            with torch.cuda.amp.autocast(enabled=FP16):
+                                _, vd = model(vm, vma, vli, vll)
+                            for k in val_losses:
+                                val_losses[k] += vd[k]
+                            n_val += 1
 
-                for k in val_losses:
-                    val_losses[k] /= n_val
-                    writer.add_scalar(f'val/{k}', val_losses[k], step)
+                    for k in val_losses:
+                        val_losses[k] /= n_val
+                        writer.add_scalar(f'val/{k}', val_losses[k], step)
 
-                print(f'\n>>> VAL step {step} | '
-                      f'total={val_losses["total"]:.4f} '
-                      f'recon={val_losses["recon"]:.4f} '
-                      f'ctc={val_losses["ctc"]:.4f} '
-                      f'contrast={val_losses["contrast"]:.4f}')
+                    print(f'\n>>> VAL step {step} | '
+                          f'total={val_losses["total"]:.4f} '
+                          f'recon={val_losses["recon"]:.4f} '
+                          f'ctc={val_losses["ctc"]:.4f} '
+                          f'contrast={val_losses["contrast"]:.4f}')
 
-                # Save full checkpoint
-                ckpt = {
-                    'step'            : step,
-                    'encoder_state'   : model.encoder.state_dict(),
-                    'decoder_state'   : model.decoder.state_dict(),
-                    'ctc_head_state'  : model.ctc_head.state_dict(),
-                    'optimizer_state' : optimizer.state_dict(),
-                    'scheduler_state' : scheduler.state_dict(),
-                    'val_loss'        : val_losses['total'],
-                }
-                torch.save(ckpt, f'{OUTPUT_DIR}/ckpt_step{step}.pt')
+                    # Save full checkpoint
+                    ckpt = {
+                        'step'            : step,
+                        'encoder_state'   : model.encoder.state_dict(),
+                        'decoder_state'   : model.decoder.state_dict(),
+                        'ctc_head_state'  : model.ctc_head.state_dict(),
+                        'optimizer_state' : optimizer.state_dict(),
+                        'scheduler_state' : scheduler.state_dict(),
+                        'val_loss'        : val_losses['total'],
+                    }
+                    torch.save(ckpt, f'{OUTPUT_DIR}/ckpt_step{step}.pt')
 
-                if val_losses['total'] < best_val_loss:
-                    best_val_loss = val_losses['total']
-                    torch.save(ckpt, f'{OUTPUT_DIR}/best.pt')
-                    print(f'  ↳ New best val loss: {best_val_loss:.4f}  (saved best.pt)')
+                    if val_losses['total'] < best_val_loss:
+                        best_val_loss = val_losses['total']
+                        torch.save(ckpt, f'{OUTPUT_DIR}/best.pt')
+                        print(f'  ↳ New best val loss: {best_val_loss:.4f}  (saved best.pt)')
 
-                model.train()
+                    model.train()
 
-writer.close()
-print(f'\nTraining complete. Best val loss: {best_val_loss:.4f}')
+    writer.close()
+    print(f'\nTraining complete. Best val loss: {best_val_loss:.4f}')
 
 """## 9. Export — save ONLY the encoder (everything else is discarded)"""
 
-# Load best checkpoint
-best_ckpt = torch.load(f'{OUTPUT_DIR}/best.pt', map_location=device)
-model.encoder.load_state_dict(best_ckpt['encoder_state'])
-model.encoder.eval()
-
-# Save just the encoder state_dict — this replaces custom_autoencoder.pt
-torch.save(
-    model.encoder.state_dict(),
-    f'{OUTPUT_DIR}/custom_encoder_v2.pt'
-)
-print(f'Encoder saved to {OUTPUT_DIR}/custom_encoder_v2.pt')
-print(f'Encoder params: {sum(p.numel() for p in model.encoder.parameters())/1e6:.1f}M')
+if SKIP_ENCODER_TRAIN:
+    print(f'Encoder export skipped — already at {ENCODER_EXPORT}')
+elif Path(f'{OUTPUT_DIR}/best.pt').exists():
+    best_ckpt = torch.load(f'{OUTPUT_DIR}/best.pt', map_location=device, weights_only=False)
+    model.encoder.load_state_dict(best_ckpt['encoder_state'])
+    model.encoder.eval()
+    torch.save(
+        model.encoder.state_dict(),
+        str(ENCODER_EXPORT),
+    )
+    print(f'Encoder saved to {ENCODER_EXPORT}')
+    print(f'Encoder params: {sum(p.numel() for p in model.encoder.parameters())/1e6:.1f}M')
+else:
+    print('No encoder checkpoint to export.')
 
 """## 10. Inference test — verify encoder output is ModalityAdapter-compatible"""
 
@@ -705,8 +788,8 @@ class ModalityAdapter(nn.Module):
 
 # LOAD TRAINED ENCODER
 encoder = CustomSpeechEncoder().to(device)
-encoder.load_state_dict(torch.load('custom_encoder_v2.pt',
-                                    map_location=device))
+encoder.load_state_dict(torch.load(str(ENCODER_EXPORT),
+                                    map_location=device, weights_only=False))
 encoder.eval()
 
 adapter = ModalityAdapter().to(device)
@@ -714,8 +797,8 @@ adapter.eval()
 
 # RUN A REAL CLIP END-TO-END
 
-sample = pd.read_csv('/content/train.csv').iloc[0]
-wav, sr = torchaudio.load(sample['wav_path'])
+sample = pd.read_csv(TRAIN_CSV).iloc[0]
+wav, sr = load_wav(sample['wav_path'])
 mel_input = wav_to_mel(wav, sr).unsqueeze(0).to(device)  # (1, 80, 862)
 
 with torch.no_grad():
@@ -758,7 +841,7 @@ print("✅ Test 1 passed: deterministic output")
 
 # Test 2: Different clips → outputs should be different
 sample2 = pd.read_csv(TRAIN_CSV).iloc[100]
-wav2, sr2 = torchaudio.load(sample2['wav_path'])
+wav2, sr2 = load_wav(sample2['wav_path'])
 mel2 = wav_to_mel(wav2, sr2).unsqueeze(0).to(device)
 with torch.no_grad():
     z3 = encoder(mel2)
@@ -779,19 +862,25 @@ print(f"✅ Test 3: cosine similarity original vs augmented = {cos_sim_aug:.4f}"
 print(f"   (should be HIGH ~0.85-0.99 — same speech, different masking)")
 
 # Test 4: Load best.pt and check what val loss was achieved
-best_ckpt = torch.load('/content/best.pt', map_location=device)
-print(f"\n📊 Training summary:")
-print(f"   Best val loss : {best_ckpt['val_loss']:.4f}")
-print(f"   Reached at step: {best_ckpt['step']}")
-print(f"\n   Val loss interpretation:")
-print(f"   > 3.0  → model barely learned anything")
-print(f"   1.5-3.0 → model learning but needs more training")
-print(f"   0.8-1.5 → good — usable representations")
-print(f"   < 0.8  → excellent")
+enc_best = Path(OUTPUT_DIR) / 'best.pt'
+if enc_best.exists():
+    best_ckpt = torch.load(enc_best, map_location=device, weights_only=False)
+    print(f"\n📊 Training summary:")
+    print(f"   Best val loss : {best_ckpt['val_loss']:.4f}")
+    print(f"   Reached at step: {best_ckpt['step']}")
+    print(f"\n   Val loss interpretation:")
+    print(f"   > 3.0  → model barely learned anything")
+    print(f"   1.5-3.0 → model learning but needs more training")
+    print(f"   0.8-1.5 → good — usable representations")
+    print(f"   < 0.8  → excellent")
+else:
+    print("\n📊 No encoder best.pt found — run encoder training first.")
 
 # ================================================
 # ENCODER INFERENCE VISUALIZATION
 # ================================================
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
@@ -804,7 +893,7 @@ fig = plt.figure(figsize=(18, 10))
 gs = gridspec.GridSpec(3, 3, figure=fig)
 
 for row, (_, sample) in enumerate(samples.iterrows()):
-    wav, sr = torchaudio.load(sample['wav_path'])
+    wav, sr = load_wav(sample['wav_path'])
     mel = wav_to_mel(wav, sr).unsqueeze(0).to(device)
 
     with torch.no_grad():
@@ -845,7 +934,7 @@ print('Saved: encoder_inference_check.png')
 
 encoder.eval()
 sample = pd.read_csv(TRAIN_CSV).iloc[0]
-wav, sr = torchaudio.load(sample['wav_path'])
+wav, sr = load_wav(sample['wav_path'])
 
 # Test 1: full padded clip (what you have now)
 mel_full = wav_to_mel(wav, sr).unsqueeze(0).to(device)
@@ -899,8 +988,11 @@ tokenizer.pad_token = tokenizer.eos_token
 llm = AutoModelForCausalLM.from_pretrained(
     LLM_ID,
     torch_dtype=torch.float16 if FP16 else torch.float32,
-    device_map='auto',
 )
+if device.type == 'cuda':
+    llm = llm.to(device)
+else:
+    llm = llm.to(device)
 
 # Freeze base LLM weights
 for p in llm.parameters():
@@ -958,7 +1050,7 @@ class StageADataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        wav, sr = torchaudio.load(row['wav_path'])
+        wav, sr = load_wav(row['wav_path'])
         mel = wav_to_mel_cpu(wav, sr)                      # CPU tensor
 
         tokens = tokenizer(
@@ -979,10 +1071,11 @@ def collate_fn(batch):
 train_ds = StageADataset(TRAIN_CSV)
 val_ds   = StageADataset(VAL_CSV)
 
+_num_workers = 0 if device.type in {'mps', 'cpu'} else 2
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE_A, shuffle=True,
-                          num_workers=4, collate_fn=collate_fn, pin_memory=True)
+                          num_workers=_num_workers, collate_fn=collate_fn, pin_memory=False)
 val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE_A, shuffle=False,
-                          num_workers=2, collate_fn=collate_fn, pin_memory=True)
+                          num_workers=_num_workers, collate_fn=collate_fn, pin_memory=False)
 
 print(f'train: {len(train_ds)} | val: {len(val_ds)}')
 mel_t, ids_t, mask_t = [x.to(device) for x in next(iter(train_loader))]
@@ -1045,13 +1138,19 @@ class ModalityAdapter(nn.Module):
 
 # ── Encoder: load weights, freeze everything ───────────────────────────────
 encoder = CustomSpeechEncoder().to(device)
-encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=device))
+encoder.load_state_dict(torch.load(str(ENCODER_EXPORT), map_location=device, weights_only=False))
 encoder.eval()
 for p in encoder.parameters():
     p.requires_grad = False
 
 # ── Adapter: trainable ─────────────────────────────────────────────────────
 adapter = ModalityAdapter().to(device)
+
+if SKIP_STAGE_A_TRAIN:
+    _stage_a = torch.load(STAGE_A_BEST, map_location=device, weights_only=False)
+    adapter.load_state_dict(_stage_a['adapter_state'])
+    llm.load_state_dict(_stage_a['lora_state'])
+    print(f'Loaded Stage A weights from {STAGE_A_BEST} (step {_stage_a["step"]})')
 
 enc_params     = sum(p.numel() for p in encoder.parameters()) / 1e6
 adapter_params = sum(p.numel() for p in adapter.parameters() if p.requires_grad) / 1e6
@@ -1141,123 +1240,119 @@ print(f'Total trainable params : {total_trainable:.1f}M')
 print('Optimizer ready ✓')
 
 # Fix the LR scheduler — reset and resume from checkpoint
-best_ckpt = torch.load(f'{OUTPUT_DIR_A}/ckpt_step1500.pt', map_location=device)
-adapter.load_state_dict(best_ckpt['adapter_state'])
-llm.load_state_dict(best_ckpt['lora_state'])
+if SKIP_STAGE_A_TRAIN:
+    print(f'Skipping Stage A training — using {STAGE_A_BEST}')
+    stage_a_ckpt = torch.load(STAGE_A_BEST, map_location=device, weights_only=False)
+    adapter.load_state_dict(stage_a_ckpt['adapter_state'])
+    llm.load_state_dict(stage_a_ckpt['lora_state'])
+    best_val = float(stage_a_ckpt['val_loss'])
+else:
+    best_ckpt = torch.load(f'{OUTPUT_DIR_A}/ckpt_step1500.pt', map_location=device, weights_only=False)
+    adapter.load_state_dict(best_ckpt['adapter_state'])
+    llm.load_state_dict(best_ckpt['lora_state'])
 
-# Rebuild optimizer and scheduler fresh
-optimizer = torch.optim.AdamW(
-    trainable_params, lr=LR_A, weight_decay=1e-2, betas=(0.9, 0.98)
-)
+    # Rebuild optimizer and scheduler fresh
+    optimizer = torch.optim.AdamW(
+        trainable_params, lr=LR_A, weight_decay=1e-2, betas=(0.9, 0.98)
+    )
 
-def get_lr(step):
-    if step < WARMUP_STEPS_A:
-        return step / max(1, WARMUP_STEPS_A)
-    progress = (step - WARMUP_STEPS_A) / max(1, MAX_STEPS_A - WARMUP_STEPS_A)
-    return max(0.05, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    def get_lr_a(step):
+        if step < WARMUP_STEPS_A:
+            return step / max(1, WARMUP_STEPS_A)
+        progress = (step - WARMUP_STEPS_A) / max(1, MAX_STEPS_A - WARMUP_STEPS_A)
+        return max(0.05, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
-scaler    = torch.cuda.amp.GradScaler(enabled=FP16)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_a)
+    scaler    = torch.cuda.amp.GradScaler(enabled=FP16)
 
-# Fast-forward scheduler to step 1500 without triggering the bug
-for _ in range(1500):
-    optimizer.step()      # dummy step to satisfy scheduler
-    scheduler.step()
+    # Fast-forward scheduler to step 1500 without triggering the bug
+    for _ in range(1500):
+        optimizer.step()      # dummy step to satisfy scheduler
+        scheduler.step()
 
-print(f'LR after fast-forward: {scheduler.get_last_lr()[0] * LR_A:.2e}')
-print('Expected: ~2e-4')
+    print(f'LR after fast-forward: {scheduler.get_last_lr()[0] * LR_A:.2e}')
+    print('Expected: ~2e-4')
 
-"""##Cell 11 — Training loop"""
+    """##Cell 11 — Training loop"""
 
-import os
-from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
+    os.makedirs(OUTPUT_DIR_A, exist_ok=True) # Changed OUTPUT_DIR to OUTPUT_DIR_A
+    writer     = SummaryWriter(f'{OUTPUT_DIR_A}/tb_logs') # Changed OUTPUT_DIR to OUTPUT_DIR_A
 
-os.makedirs(OUTPUT_DIR_A, exist_ok=True) # Changed OUTPUT_DIR to OUTPUT_DIR_A
-writer     = SummaryWriter(f'{OUTPUT_DIR_A}/tb_logs') # Changed OUTPUT_DIR to OUTPUT_DIR_A
+    step       = 1500
+    accum_step = 0
+    best_val   = 2.8582
+    running_loss = 0.0
 
-step       = 1500
-accum_step = 0
-best_val   = 2.8582
-running_loss = 0.0
+    adapter.train()
+    llm.train()
+    optimizer.zero_grad()
 
-adapter.train()
-llm.train()
-optimizer.zero_grad()
+    print(f'Starting Stage A — {MAX_STEPS_A} steps') # Changed MAX_STEPS to MAX_STEPS_A
+    print(f'Effective batch size: {BATCH_SIZE_A * GRAD_ACCUM_A}') # Changed BATCH_SIZE * GRAD_ACCUM to BATCH_SIZE_A * GRAD_ACCUM_A
 
-print(f'Starting Stage A — {MAX_STEPS_A} steps') # Changed MAX_STEPS to MAX_STEPS_A
-print(f'Effective batch size: {BATCH_SIZE_A * GRAD_ACCUM_A}') # Changed BATCH_SIZE * GRAD_ACCUM to BATCH_SIZE_A * GRAD_ACCUM_A
+    while step < MAX_STEPS_A: # Changed MAX_STEPS to MAX_STEPS_A
+        for batch in train_loader:
+            if step >= MAX_STEPS_A: # Changed MAX_STEPS to MAX_STEPS_A
+                break
 
-while step < MAX_STEPS_A: # Changed MAX_STEPS to MAX_STEPS_A
-    for batch in train_loader:
-        if step >= MAX_STEPS_A: # Changed MAX_STEPS to MAX_STEPS_A
-            break
+            mel, ids, mask = [x.to(device) for x in batch]
 
-        mel, ids, mask = [x.to(device) for x in batch]
+            with torch.cuda.amp.autocast(enabled=FP16):
+                loss = forward_pass(mel, ids, mask) / GRAD_ACCUM_A # Changed GRAD_ACCUM to GRAD_ACCUM_A
 
-        with torch.cuda.amp.autocast(enabled=FP16):
-            loss = forward_pass(mel, ids, mask) / GRAD_ACCUM_A # Changed GRAD_ACCUM to GRAD_ACCUM_A
+            scaler.scale(loss).backward()
+            accum_step   += 1
+            running_loss += loss.item()
 
-        scaler.scale(loss).backward()
-        accum_step   += 1
-        running_loss += loss.item()
+            if accum_step == GRAD_ACCUM_A: # Changed GRAD_ACCUM to GRAD_ACCUM_A
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+                accum_step = 0
+                step      += 1
 
-        if accum_step == GRAD_ACCUM_A: # Changed GRAD_ACCUM to GRAD_ACCUM_A
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            optimizer.zero_grad()
-            accum_step = 0
-            step      += 1
+                if step % LOG_EVERY_A == 0: # Changed LOG_EVERY to LOG_EVERY_A
+                    avg = running_loss / LOG_EVERY_A # Changed LOG_EVERY to LOG_EVERY_A
+                    writer.add_scalar('train/loss', avg, step)
+                    writer.add_scalar('train/lr', scheduler.get_last_lr()[0] * LR_A, step) # Changed LR to LR_A
+                    print(f'step {step:>6}/{MAX_STEPS_A} | loss={avg:.4f} | ' # Changed MAX_STEPS to MAX_STEPS_A
+                          f'lr={scheduler.get_last_lr()[0]*LR_A:.2e}') # Changed LR to LR_A
+                    running_loss = 0.0
 
-            if step % LOG_EVERY_A == 0: # Changed LOG_EVERY to LOG_EVERY_A
-                avg = running_loss / LOG_EVERY_A # Changed LOG_EVERY to LOG_EVERY_A
-                writer.add_scalar('train/loss', avg, step)
-                writer.add_scalar('train/lr', scheduler.get_last_lr()[0] * LR_A, step) # Changed LR to LR_A
-                print(f'step {step:>6}/{MAX_STEPS_A} | loss={avg:.4f} | ' # Changed MAX_STEPS to MAX_STEPS_A
-                      f'lr={scheduler.get_last_lr()[0]*LR_A:.2e}') # Changed LR to LR_A
-                running_loss = 0.0
+                if step % SAVE_EVERY_A == 0: # Changed SAVE_EVERY to SAVE_EVERY_A
+                    adapter.eval(); llm.eval()
+                    val_loss = 0.0; n = 0
+                    with torch.no_grad():
+                        for vb in val_loader:
+                            vm, vi, vk = [x.to(device) for x in vb]
+                            with torch.cuda.amp.autocast(enabled=FP16):
+                                val_loss += forward_pass(vm, vi, vk).item()
+                            n += 1
+                    val_loss /= n
+                    writer.add_scalar('val/loss', val_loss, step)
+                    print(f'\n>>> VAL step {step} | loss={val_loss:.4f}')
 
-            if step % SAVE_EVERY_A == 0: # Changed SAVE_EVERY to SAVE_EVERY_A
-                adapter.eval(); llm.eval()
-                val_loss = 0.0; n = 0
-                with torch.no_grad():
-                    for vb in val_loader:
-                        vm, vi, vk = [x.to(device) for x in vb]
-                        with torch.cuda.amp.autocast(enabled=FP16):
-                            val_loss += forward_pass(vm, vi, vk).item()
-                        n += 1
-                val_loss /= n
-                writer.add_scalar('val/loss', val_loss, step)
-                print(f'\n>>> VAL step {step} | loss={val_loss:.4f}')
+                    ckpt = {
+                        'step'          : step,
+                        'adapter_state' : adapter.state_dict(),
+                        'lora_state'    : llm.state_dict(),
+                        'optimizer_state': optimizer.state_dict(),
+                        'val_loss'      : val_loss,
+                    }
+                    torch.save(ckpt, f'{OUTPUT_DIR_A}/ckpt_step{step}.pt') # Changed OUTPUT_DIR to OUTPUT_DIR_A
+                    if val_loss < best_val:
+                        best_val = val_loss
+                        torch.save(ckpt, f'{OUTPUT_DIR_A}/best.pt') # Changed OUTPUT_DIR to OUTPUT_DIR_A
+                        print(f'  ↳ New best: {best_val:.4f}')
 
-                ckpt = {
-                    'step'          : step,
-                    'adapter_state' : adapter.state_dict(),
-                    'lora_state'    : llm.state_dict(),
-                    'optimizer_state': optimizer.state_dict(),
-                    'val_loss'      : val_loss,
-                }
-                torch.save(ckpt, f'{OUTPUT_DIR_A}/ckpt_step{step}.pt') # Changed OUTPUT_DIR to OUTPUT_DIR_A
-                if val_loss < best_val:
-                    best_val = val_loss
-                    torch.save(ckpt, f'{OUTPUT_DIR_A}/best.pt') # Changed OUTPUT_DIR to OUTPUT_DIR_A
-                    print(f'  ↳ New best: {best_val:.4f}')
+                    adapter.train(); llm.train()
 
-                adapter.train(); llm.train()
-
-writer.close()
-print(f'\nStage A complete. Best val loss: {best_val:.4f}')
+    writer.close()
+    print(f'\nStage A complete. Best val loss: {best_val:.4f}')
 
 """##Cell 12 — Interpret results"""
 
-best = torch.load(f'{OUTPUT_DIR_A}/best.pt', map_location=device) # Changed OUTPUT_DIR to OUTPUT_DIR_A
-print(f'Best val loss : {best["val_loss"]:.4f}  at step {best["step"]}')
-print()
-print('Loss interpretation:')
-print('  > 4.0  → adapter not converging, check forward_pass shapes')
-print('  2.5-4.0 → learning but needs more steps')
-print('  1.5-2.5 → good alignment, ready for Stage B')
-print('  < 1.5  → excellent, LLM strongly conditioned on audio')
+interpret_stage_a_results()

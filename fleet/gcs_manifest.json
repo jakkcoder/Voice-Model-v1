@@ -1,0 +1,19 @@
+{
+  "bucket": "voice-model-v1-487906",
+  "project": "vertex-ai-learning-487906",
+  "location": "asia-south1",
+  "prefix": "voice-model-v1/",
+  "paths": {
+    "encoder": "voice-model-v1/encoder_v2_checkpoints/custom_encoder_v2.pt",
+    "stage_a_best": "voice-model-v1/stage_a_checkpoints/best.pt",
+    "train_csv": "voice-model-v1/data/train.csv",
+    "val_csv": "voice-model-v1/data/val.csv",
+    "job_state": "voice-model-v1/fleet/job_state.json"
+  },
+  "notes": {
+    "ljspeech": "Not uploaded (~3.6 GB). Download on each machine: https://keithito.com/LJ-Speech-Dataset/",
+    "resume_stage_a": "RESUME=stage_a_checkpoints/best.pt ./scripts/run_stage_a_native.sh",
+    "pull": "./fleet/sync_gcs.sh pull",
+    "push": "./fleet/sync_gcs.sh push-best"
+  }
+}
