@@ -55,6 +55,8 @@ WARMUP_STEPS = 300
 MAX_STEPS = 15000
 SAVE_EVERY = 1500
 LOG_EVERY = 50
+EARLY_STOP_PATIENCE = 2
+TARGET_VAL_LOSS = 2.5
 MAX_TEXT_LEN = 128
 OUTPUT_DIR = "stage_a_checkpoints"
 
@@ -443,6 +445,21 @@ def load_checkpoint(
     return step, best_val
 
 
+def load_best_weights(
+    path: str,
+    adapter: ModalityAdapter,
+    llm,
+    device: torch.device,
+) -> tuple[int, float]:
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    adapter.load_state_dict(ckpt["adapter_state"])
+    llm.load_state_dict(ckpt["lora_state"])
+    step = int(ckpt["step"])
+    best_val = float(ckpt.get("best_val_loss", ckpt["val_loss"]))
+    print(f"Restored best weights from {path} (step {step}, val_loss={best_val:.4f})")
+    return step, best_val
+
+
 def train(args: argparse.Namespace) -> None:
     global _shutdown_requested
     _shutdown_requested = False
@@ -510,10 +527,6 @@ def train(args: argparse.Namespace) -> None:
         weight_decay=1e-2,
         betas=(0.9, 0.98),
     )
-    scheduler = optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda step: get_lr(step, args.warmup_steps, args.max_steps),
-    )
     scaler = torch.amp.GradScaler(device.type, enabled=autocast)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -521,12 +534,36 @@ def train(args: argparse.Namespace) -> None:
 
     step = 0
     best_val = float("inf")
+    vals_without_improvement = 0
+    scheduler_base_step = 0
+    schedule_max_steps = args.max_steps
     if args.resume:
         step, best_val = load_checkpoint(
             args.resume, adapter, llm, optimizer, device
         )
+        if args.reset_lr_schedule:
+            scheduler_base_step = step
+            schedule_max_steps = max(1, args.max_steps - step)
+            optimizer = optim.AdamW(
+                trainable_params,
+                lr=args.lr,
+                weight_decay=1e-2,
+                betas=(0.9, 0.98),
+            )
+            optimizer.zero_grad()
+
+    scheduler = optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda rel: get_lr(rel, args.warmup_steps, schedule_max_steps),
+    )
+    if args.resume and not args.reset_lr_schedule:
         for _ in range(step):
             scheduler.step()
+    elif args.resume and args.reset_lr_schedule:
+        print(
+            f"LR schedule reset from step {step} "
+            f"(warmup={args.warmup_steps}, finetune_steps={schedule_max_steps}, lr={args.lr:.1e})"
+        )
 
     mel_t, ids_t, mask_t = [x.to(device) for x in next(iter(train_loader))]
     with torch.autocast(device_type=device.type, enabled=autocast):
@@ -543,6 +580,13 @@ def train(args: argparse.Namespace) -> None:
 
     print(f"Starting Stage A — target {args.max_steps} steps")
     print(f"Effective batch size: {args.batch_size * args.grad_accum}")
+    if args.early_stop_patience:
+        print(
+            f"Early stop: patience={args.early_stop_patience} validations "
+            f"(every {args.save_every} steps)"
+        )
+    if args.target_val_loss:
+        print(f"Target val loss: <= {args.target_val_loss:.2f} (good alignment range)")
 
     pbar = tqdm(total=args.max_steps, initial=step, desc="Stage A", unit="step")
 
@@ -568,7 +612,9 @@ def train(args: argparse.Namespace) -> None:
         pbar.write(f">>> Saved resume checkpoint: {latest_path} (step {step})")
 
     interrupted = False
-    while step < args.max_steps and not _shutdown_requested:
+    stop_training = False
+    best_path = f"{args.output_dir}/best.pt"
+    while step < args.max_steps and not _shutdown_requested and not stop_training:
         for batch in train_loader:
             if step >= args.max_steps or _shutdown_requested:
                 break
@@ -596,7 +642,7 @@ def train(args: argparse.Namespace) -> None:
 
                 if step % args.log_every == 0:
                     avg = running_loss / log_steps
-                    lr_now = scheduler.get_last_lr()[0] * args.lr
+                    lr_now = scheduler.get_last_lr()[0]
                     writer.add_scalar("train/loss", avg, step)
                     writer.add_scalar("train/lr", lr_now, step)
                     pbar.set_postfix(loss=f"{avg:.4f}", lr=f"{lr_now:.2e}")
@@ -622,8 +668,9 @@ def train(args: argparse.Namespace) -> None:
                     )
                     if val_loss < best_val:
                         best_val = val_loss
+                        vals_without_improvement = 0
                         save_checkpoint(
-                            f"{args.output_dir}/best.pt",
+                            best_path,
                             step,
                             adapter,
                             llm,
@@ -632,6 +679,30 @@ def train(args: argparse.Namespace) -> None:
                             best_val,
                         )
                         pbar.write(f"  New best: {best_val:.4f}")
+                    else:
+                        vals_without_improvement += 1
+                        pbar.write(
+                            f"  No improvement ({vals_without_improvement}/"
+                            f"{args.early_stop_patience or 'off'})"
+                        )
+
+                    if args.target_val_loss and val_loss <= args.target_val_loss:
+                        pbar.write(
+                            f"Target val loss reached ({val_loss:.4f} <= "
+                            f"{args.target_val_loss:.2f}) — stopping"
+                        )
+                        stop_training = True
+                    elif (
+                        args.early_stop_patience
+                        and vals_without_improvement >= args.early_stop_patience
+                    ):
+                        pbar.write(
+                            f"Early stopping after {vals_without_improvement} "
+                            f"validations without improvement"
+                        )
+                        if Path(best_path).exists():
+                            load_best_weights(best_path, adapter, llm, device)
+                        stop_training = True
 
                     adapter.train()
                     llm.train()
@@ -651,10 +722,10 @@ def train(args: argparse.Namespace) -> None:
 
     print(f"\nStage A complete. Best val loss: {best_val:.4f}")
     print("Loss interpretation:")
-    print("  > 4.0   → adapter not converging")
-    print("  2.5-4.0 → learning, may need more steps")
-    print("  1.5-2.5 → good alignment, ready for Stage B")
-    print("  < 1.5   → excellent conditioning on audio")
+    print("  > 4.0   -> adapter not converging")
+    print("  2.5-4.0 -> learning, may need more steps")
+    print("  1.5-2.5 -> good alignment, ready for Stage B")
+    print("  < 1.5   -> excellent conditioning on audio")
 
 
 def parse_args() -> argparse.Namespace:
@@ -682,7 +753,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to Stage A checkpoint (.pt) to resume from",
     )
+    parser.add_argument(
+        "--reset-lr-schedule",
+        action="store_true",
+        help="Restart cosine LR schedule from the resume step (use for finetune phase)",
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=EARLY_STOP_PATIENCE,
+        help="Stop after N validations without val-loss improvement (0 disables)",
+    )
+    parser.add_argument(
+        "--target-val-loss",
+        type=float,
+        default=TARGET_VAL_LOSS,
+        help="Stop when val loss reaches this target (0 disables)",
+    )
     args = parser.parse_args()
+
+    if args.early_stop_patience == 0:
+        args.early_stop_patience = None
+    if args.target_val_loss == 0:
+        args.target_val_loss = None
 
     if args.batch_size is None:
         device = get_device()
